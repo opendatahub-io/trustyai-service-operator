@@ -1,0 +1,12 @@
+pull_request_rules:
+  - name: Automatic sync to incubation
+    conditions:
+      - base=main
+      - author!=Mergify[bot]
+      - repository-full-name=opendatahub-io/trustyai-service-operator
+    actions:
+      backport:
+        branches:
+          - incubation
+        labels:
+          - bot/sync-incubation
