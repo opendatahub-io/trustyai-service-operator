@@ -151,9 +151,15 @@ func (r *GuardrailsOrchestratorReconciler) getInferenceServicesAndServingRuntime
 	if err := r.List(ctx, &servingRuntimes, &client.ListOptions{
 		Namespace: namespace,
 	}); err != nil || len(servingRuntimes.Items) == 0 {
+<<<<<<< HEAD
+=======
+		if len(servingRuntimes.Items) == 0 {
+			err = fmt.Errorf("no ServingRuntimes found in namespace %s", namespace)
+		}
+		log.FromContext(ctx).Error(err, "could not list all ServingRuntimes in", "namespace", namespace)
+>>>>>>> 343e3a0 (Fix logging bug in auto config sr logs (#598))
 		return kservev1beta1.InferenceServiceList{}, v1alpha1.ServingRuntimeList{}, fmt.Errorf("could not automatically find serving runtimes: %w", err)
 	}
-
 	return inferenceServices, servingRuntimes, nil
 }
 
