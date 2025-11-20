@@ -3,7 +3,9 @@ package gorch
 import (
 	"context"
 	"fmt"
+	"github.com/trustyai-explainability/trustyai-service-operator/controllers/utils"
 	"reflect"
+	"strings"
 	"time"
 
 	gorchv1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/gorch/v1alpha1"
@@ -39,7 +41,7 @@ type DeploymentConfig struct {
 func (r *GuardrailsOrchestratorReconciler) createDeployment(ctx context.Context, orchestrator *gorchv1alpha1.GuardrailsOrchestrator) (*appsv1.Deployment, error) {
 	var containerImages ContainerImages
 
-	orchestratorImage, err := r.getImageFromConfigMap(ctx, orchestratorImageKey, constants.ConfigMap, r.Namespace)
+	orchestratorImage, err := utils.GetImageFromConfigMap(ctx, r.Client, orchestratorImageKey, constants.ConfigMap, r.Namespace)
 	if orchestratorImage == "" || err != nil {
 		log.FromContext(ctx).Error(err, "Error getting container image from ConfigMap.")
 		return nil, err
@@ -49,7 +51,7 @@ func (r *GuardrailsOrchestratorReconciler) createDeployment(ctx context.Context,
 
 	// Check if the regex detectors are enabled
 	if orchestrator.Spec.EnableBuiltInDetectors {
-		detectorImage, err := r.getImageFromConfigMap(ctx, detectorImageKey, constants.ConfigMap, r.Namespace)
+		detectorImage, err := utils.GetImageFromConfigMap(ctx, r.Client, detectorImageKey, constants.ConfigMap, r.Namespace)
 		if detectorImage == "" || err != nil {
 			log.FromContext(ctx).Error(err, "Error getting detectors image from ConfigMap.")
 			return nil, err
@@ -60,7 +62,7 @@ func (r *GuardrailsOrchestratorReconciler) createDeployment(ctx context.Context,
 
 	// Check if the guardrails sidecar gateway is enabled
 	if orchestrator.Spec.EnableGuardrailsGateway {
-		guardrailsGatewayImage, err := r.getImageFromConfigMap(ctx, gatewayImageKey, constants.ConfigMap, r.Namespace)
+		guardrailsGatewayImage, err := utils.GetImageFromConfigMap(ctx, r.Client, gatewayImageKey, constants.ConfigMap, r.Namespace)
 		if guardrailsGatewayImage == "" || err != nil {
 			log.FromContext(ctx).Error(err, "Error getting guardrails sidecar gateway image from ConfigMap.")
 		}
@@ -84,11 +86,23 @@ func (r *GuardrailsOrchestratorReconciler) createDeployment(ctx context.Context,
 	}
 
 	var deployment *appsv1.Deployment
-	deployment, err = templateParser.ParseResource[appsv1.Deployment](deploymentTemplatePath, deploymentConfig, reflect.TypeOf(&appsv1.Deployment{}))
+	deployment, err = templateParser.ParseResource[*appsv1.Deployment](deploymentTemplatePath, deploymentConfig, reflect.TypeOf(&appsv1.Deployment{}))
 	if err != nil {
 		log.FromContext(ctx).Error(err, "Failed to parse deployment template")
 		return nil, err
 	}
+
+	// add env vars to the deployment
+	if orchestrator.Spec.EnvVars != nil && len(*orchestrator.Spec.EnvVars) > 0 {
+		for i := range deployment.Spec.Template.Spec.Containers {
+			if !isKubeRBACProxyContainer(deployment.Spec.Template.Spec.Containers[i].Name) {
+				deployment.Spec.Template.Spec.Containers[i].Env = append(
+					deployment.Spec.Template.Spec.Containers[i].Env,
+					*orchestrator.Spec.EnvVars...)
+			}
+		}
+	}
+
 	if err := controllerutil.SetControllerReference(orchestrator, deployment, r.Scheme); err != nil {
 		log.FromContext(ctx).Error(err, "Failed to set controller reference for deployment")
 		return nil, err
@@ -175,4 +189,9 @@ func patchDeployment(existingDeployment, newDeployment *appsv1.Deployment) bool 
 	}
 
 	return changed
+}
+
+// isKubeRBACProxyContainer checks if a pod name corresponding to a kube-rbac-proxy pod
+func isKubeRBACProxyContainer(name string) bool {
+	return strings.HasPrefix(name, "kube-rbac-proxy")
 }
