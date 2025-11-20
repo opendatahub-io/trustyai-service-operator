@@ -3,6 +3,7 @@ package tas
 import (
 	"context"
 	"fmt"
+	"github.com/trustyai-explainability/trustyai-service-operator/controllers/utils"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -63,13 +64,17 @@ var _ = Describe("ConfigMap tests", func() {
 
 			WaitFor(func() error {
 				var err error
+<<<<<<< HEAD
 				actualOAuthImage, err = reconciler.getImageFromConfigMap(ctx, configMapOAuthProxyImageKey, defaultOAuthProxyImage)
+=======
+				actualKubeRBACProxyImage, err = utils.GetImageFromConfigMapWithFallback(ctx, k8sClient, configMapKubeRBACProxyImageKey, constants.ConfigMap, operatorNamespace, defaultKubeRBACProxyImage)
+>>>>>>> b3ba151 (Cleanup: Generalize configmap and route creation, reconciliation functions (#601))
 				return err
 			}, "failed to get oauth image from ConfigMap")
 
 			WaitFor(func() error {
 				var err error
-				actualServiceImage, err = reconciler.getImageFromConfigMap(ctx, configMapServiceImageKey, defaultImage)
+				actualServiceImage, err = utils.GetImageFromConfigMapWithFallback(ctx, k8sClient, configMapServiceImageKey, constants.ConfigMap, operatorNamespace, defaultImage)
 				return err
 			}, "failed to get service image from ConfigMap")
 
@@ -87,14 +92,28 @@ var _ = Describe("ConfigMap tests", func() {
 
 			WaitFor(func() error {
 				var err error
+<<<<<<< HEAD
 				actualOAuthImage, err = reconciler.getImageFromConfigMap(ctx, configMapOAuthProxyImageKey, defaultOAuthProxyImage)
 				return err
 			}, "failed to get oauth image from ConfigMap")
+=======
+				actualKubeRBACProxyImage, err = utils.GetImageFromConfigMapWithFallback(ctx, k8sClient, configMapKubeRBACProxyImageKey, constants.ConfigMap, operatorNamespace, defaultKubeRBACProxyImage)
+				if err != nil {
+					Expect(err).To(MatchError(fmt.Sprintf("configmap %s not found in namespace %s", constants.ConfigMap, operatorNamespace)))
+					return nil
+				}
+				return nil
+			}, "failed to get kube-rbac-proxy image from ConfigMap")
+>>>>>>> b3ba151 (Cleanup: Generalize configmap and route creation, reconciliation functions (#601))
 
 			WaitFor(func() error {
 				var err error
-				actualServiceImage, err = reconciler.getImageFromConfigMap(ctx, configMapServiceImageKey, defaultImage)
-				return err
+				actualServiceImage, err = utils.GetImageFromConfigMapWithFallback(ctx, k8sClient, configMapServiceImageKey, constants.ConfigMap, operatorNamespace, defaultImage)
+				if err != nil {
+					Expect(err).To(MatchError(fmt.Sprintf("configmap %s not found in namespace %s", constants.ConfigMap, operatorNamespace)))
+					return nil
+				}
+				return nil
 			}, "failed to get service image from ConfigMap")
 
 			Expect(actualOAuthImage).Should(Equal(defaultOAuthProxyImage))
@@ -126,10 +145,15 @@ var _ = Describe("ConfigMap tests", func() {
 			var actualOAuthImage string
 			var actualServiceImage string
 
-			configMapPath := operatorNamespace + "/" + constants.ConfigMap
+			Eventually(func() error {
+				var err error
+				actualKubeRBACProxyImage, err = utils.GetImageFromConfigMapWithFallback(ctx, k8sClient, configMapKubeRBACProxyImageKey, constants.ConfigMap, operatorNamespace, defaultKubeRBACProxyImage)
+				return err
+			}, defaultTimeout, defaultPolling).Should(MatchError(fmt.Sprintf("configmap %s in namespace %s does not contain key %s", constants.ConfigMap, operatorNamespace, configMapKubeRBACProxyImageKey)), "failed to get kube-rbac-proxy image from ConfigMap")
 
 			Eventually(func() error {
 				var err error
+<<<<<<< HEAD
 				actualOAuthImage, err = reconciler.getImageFromConfigMap(ctx, configMapOAuthProxyImageKey, defaultOAuthProxyImage)
 				return err
 			}, defaultTimeout, defaultPolling).Should(MatchError(fmt.Sprintf("configmap %s does not contain necessary keys", configMapPath)), "failed to get oauth image from ConfigMap")
@@ -139,6 +163,11 @@ var _ = Describe("ConfigMap tests", func() {
 				actualServiceImage, err = reconciler.getImageFromConfigMap(ctx, configMapServiceImageKey, defaultImage)
 				return err
 			}, defaultTimeout, defaultPolling).Should(MatchError(fmt.Sprintf("configmap %s does not contain necessary keys", configMapPath)), "failed to get oauth image from ConfigMap")
+=======
+				actualServiceImage, err = utils.GetImageFromConfigMapWithFallback(ctx, k8sClient, configMapServiceImageKey, constants.ConfigMap, operatorNamespace, defaultImage)
+				return err
+			}, defaultTimeout, defaultPolling).Should(MatchError(fmt.Sprintf("configmap %s in namespace %s does not contain key %s", constants.ConfigMap, operatorNamespace, configMapServiceImageKey)), "failed to get service image from ConfigMap")
+>>>>>>> b3ba151 (Cleanup: Generalize configmap and route creation, reconciliation functions (#601))
 
 			Expect(actualOAuthImage).Should(Equal(defaultOAuthProxyImage))
 			Expect(actualServiceImage).Should(Equal(defaultImage))

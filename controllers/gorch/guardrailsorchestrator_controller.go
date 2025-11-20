@@ -20,7 +20,13 @@ import (
 	"context"
 	"github.com/go-logr/logr"
 	kservev1beta1 "github.com/kserve/kserve/pkg/apis/serving/v1beta1"
+<<<<<<< HEAD
+=======
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	templateParser "github.com/trustyai-explainability/trustyai-service-operator/controllers/gorch/templates"
+>>>>>>> b3ba151 (Cleanup: Generalize configmap and route creation, reconciliation functions (#601))
 	"github.com/trustyai-explainability/trustyai-service-operator/controllers/metrics"
+	"github.com/trustyai-explainability/trustyai-service-operator/controllers/utils"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -28,7 +34,6 @@ import (
 	"strconv"
 	"time"
 
-	routev1 "github.com/openshift/api/route/v1"
 	gorchv1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/gorch/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -315,6 +320,7 @@ func (r *GuardrailsOrchestratorReconciler) Reconcile(ctx context.Context, req ct
 		return ctrl.Result{}, err
 	}
 
+<<<<<<< HEAD
 	existingConfigMap := &corev1.ConfigMap{}
 	err = r.Get(ctx, types.NamespacedName{Name: orchestrator.Name + "-ca-bundle", Namespace: orchestrator.Namespace}, existingConfigMap)
 	if err != nil && errors.IsNotFound(err) {
@@ -356,10 +362,28 @@ func (r *GuardrailsOrchestratorReconciler) Reconcile(ctx context.Context, req ct
 		}
 	} else if err != nil {
 		log.Error(err, "Failed to get Route")
+=======
+	_, _, err = utils.ReconcileConfigMap(ctx, r.Client, orchestrator, orchestrator.Name+"-ca-bundle", "", "ca-bundle-configmap.tmpl.yaml", templateParser.ParseResource)
+	if err != nil {
+		r.handleReconciliationError(ctx, log, orchestrator, err, ReconcileFailed, "CA Bundle ConfigMap reconciliation failed")
+		return ctrl.Result{}, err
+	}
+
+	err = r.reconcileOrchestratorRoute(ctx, orchestrator)
+	if err != nil {
+		r.handleReconciliationError(ctx, log, orchestrator, err, ReconcileFailed, "Main orchestrator route reconciliation failed")
+		return ctrl.Result{}, err
+	}
+
+	err = r.reconcileHealthRoute(ctx, orchestrator)
+	if err != nil {
+		r.handleReconciliationError(ctx, log, orchestrator, err, ReconcileFailed, "Health route reconciliation failed")
+>>>>>>> b3ba151 (Cleanup: Generalize configmap and route creation, reconciliation functions (#601))
 		return ctrl.Result{}, err
 	}
 
 	if orchestrator.Spec.EnableGuardrailsGateway {
+<<<<<<< HEAD
 		err = r.Get(ctx, types.NamespacedName{Name: orchestrator.Name + "-gateway", Namespace: orchestrator.Namespace}, existingRoute)
 		if err != nil && errors.IsNotFound(err) {
 			// Define a new route
@@ -371,6 +395,39 @@ func (r *GuardrailsOrchestratorReconciler) Reconcile(ctx context.Context, req ct
 			}
 		} else if err != nil {
 			log.Error(err, "Failed to get Route")
+=======
+		err = r.reconcileGatewayRoute(ctx, orchestrator)
+		if err != nil {
+			r.handleReconciliationError(ctx, log, orchestrator, err, ReconcileFailed, "Gateway route reconciliation failed")
+			return ctrl.Result{}, err
+		}
+	}
+
+	existingSM := &monitoringv1.ServiceMonitor{}
+	err = r.Get(ctx, types.NamespacedName{Name: orchestrator.Name + "-service-monitor", Namespace: orchestrator.Namespace}, existingSM)
+	if orchestrator.Spec.EnableBuiltInDetectors {
+		if err != nil && errors.IsNotFound(err) {
+			// Define a new route
+			serviceMonitor := r.createServiceMonitor(ctx, orchestrator)
+			log.Info("Creating a new Service Monitor", "ServiceMonitor.Namespace", serviceMonitor.Namespace, "ServiceMonitor.Name", serviceMonitor.Name)
+			err = r.Create(ctx, serviceMonitor)
+			if err != nil {
+				r.handleReconciliationErrorWithTrace(ctx, log, orchestrator, err, ReconcileFailed, "Failed to create new ServiceMonitor", "ServiceMonitor.Namespace", serviceMonitor.Namespace, "ServiceMonitor.Name", serviceMonitor.Name)
+			}
+		} else if err != nil {
+			r.handleReconciliationError(ctx, log, orchestrator, err, ReconcileFailed, "Failed to get ServiceMonitor")
+			return ctrl.Result{}, err
+		}
+	} else {
+		if err == nil {
+			log.Info("Deleting ServiceMonitor because EnableBuiltInDetectors is false", "ServiceMonitor.Namespace", existingSM.Namespace, "ServiceMonitor.Name", existingSM.Name)
+			if delErr := r.Delete(ctx, existingSM); delErr != nil && !errors.IsNotFound(delErr) {
+				r.handleReconciliationErrorWithTrace(ctx, log, orchestrator, delErr, ReconcileFailed, "Failed to delete ServiceMonitor", "ServiceMonitor.Namespace", existingSM.Namespace, "ServiceMonitor.Name", existingSM.Name)
+				return ctrl.Result{}, delErr
+			}
+		} else if err != nil && !errors.IsNotFound(err) {
+			r.handleReconciliationError(ctx, log, orchestrator, err, ReconcileFailed, "Failed to get ServiceMonitor for deletion")
+>>>>>>> b3ba151 (Cleanup: Generalize configmap and route creation, reconciliation functions (#601))
 			return ctrl.Result{}, err
 		}
 	}
