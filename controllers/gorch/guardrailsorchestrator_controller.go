@@ -104,6 +104,22 @@ func (r *GuardrailsOrchestratorReconciler) refreshOrchestrator(ctx context.Conte
 	return latestOrchestrator, nil
 }
 
+<<<<<<< HEAD
+=======
+func (r *GuardrailsOrchestratorReconciler) handleReconciliationError(ctx context.Context, log logr.Logger, orchestrator *gorchv1alpha1.GuardrailsOrchestrator, err error, reason string, message string) {
+	r.handleReconciliationErrorWithTrace(ctx, log, orchestrator, err, reason, message)
+}
+
+func (r *GuardrailsOrchestratorReconciler) handleReconciliationErrorWithTrace(ctx context.Context, log logr.Logger, orchestrator *gorchv1alpha1.GuardrailsOrchestrator, err error, reason string, message string, keysAndValues ...any) {
+	log.Info("Marking " + orchestrator.Name + " as failed. Reconciliation will not be reattempted.")
+	orchestrator, err = r.updateStatus(ctx, orchestrator, func(saved *gorchv1alpha1.GuardrailsOrchestrator) {
+		utils.UnsetProgressingCondition(&saved.Status.Conditions, reason, "")
+		utils.SetFailedCondition(&saved.Status.Conditions, reason, message)
+		saved.Status.Phase = utils.PhaseError
+	})
+}
+
+>>>>>>> f7cb3c7 (Second round of function standardization (#607))
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
 // TODO(user): Modify the Reconcile function to compare the state specified by
@@ -124,20 +140,28 @@ func (r *GuardrailsOrchestratorReconciler) Reconcile(ctx context.Context, req ct
 			log.Info("GuardrailsOrchestrator resource not found. Ignoring since object must be deleted.")
 			return ctrl.Result{}, nil
 		}
+<<<<<<< HEAD
 		log.Error(err, "Failed to get GuardrailsOrchestrator")
+=======
+		r.handleReconciliationError(ctx, log, orchestrator, err, utils.ReconcileFailed, "Failed to get GuardrailsOrchestrator")
+>>>>>>> f7cb3c7 (Second round of function standardization (#607))
 		return ctrl.Result{}, err
 	}
 
 	// Start reconcilation
 	if orchestrator.Status.Conditions == nil {
-		reason := ReconcileInit
+		reason := utils.ReconcileInit
 		message := "Initializing GuardrailsOrchestrator resource"
 		orchestrator, err = r.updateStatus(ctx, orchestrator, func(saved *gorchv1alpha1.GuardrailsOrchestrator) {
-			SetProgressingCondition(&saved.Status.Conditions, reason, message)
-			saved.Status.Phase = PhaseProgressing
+			utils.SetProgressingCondition(&saved.Status.Conditions, reason, message)
+			saved.Status.Phase = utils.PhaseProgressing
 		})
 		if err != nil {
+<<<<<<< HEAD
 			log.Error(err, "Failed to update GuardrailsOrchestrator status during initialization")
+=======
+			r.handleReconciliationError(ctx, log, orchestrator, err, utils.ReconcileFailed, "Failed to update GuardrailsOrchestrator status during initialization")
+>>>>>>> f7cb3c7 (Second round of function standardization (#607))
 			return ctrl.Result{}, err
 		}
 
@@ -186,6 +210,7 @@ func (r *GuardrailsOrchestratorReconciler) Reconcile(ctx context.Context, req ct
 		return ctrl.Result{}, nil
 	}
 
+<<<<<<< HEAD
 	existingServiceAccount := &corev1.ServiceAccount{}
 	var serviceAccountName string
 	err = r.Get(ctx, types.NamespacedName{Name: orchestrator.Name + "-serviceaccount", Namespace: orchestrator.Namespace}, existingServiceAccount)
@@ -200,14 +225,27 @@ func (r *GuardrailsOrchestratorReconciler) Reconcile(ctx context.Context, req ct
 		serviceAccountName = serviceAccount.Name
 	} else if err != nil {
 		log.Error(err, "Failed to get ServiceAccount")
-		return ctrl.Result{}, err
-	} else {
-		serviceAccountName = existingServiceAccount.Name
+=======
+	if orchestrator.Status.Conditions != nil {
+		// skip reconciliation of failed GuardrailsOrchestrator
+		for _, cond := range orchestrator.Status.Conditions {
+			if cond.Type == utils.ReconcileFailed && cond.Status == corev1.ConditionTrue {
+				return ctrl.Result{}, nil
+			}
+		}
 	}
 
-	existingClusterRoleBinding := &rbacv1.ClusterRoleBinding{}
-	err = r.Get(ctx, types.NamespacedName{Name: getClusterRoleName(orchestrator), Namespace: orchestrator.Namespace}, existingClusterRoleBinding)
+	err = utils.ReconcileServiceAccount(ctx, r.Client, orchestrator, orchestratorName+"-serviceaccount", serviceAccountTemplatePath, templateParser.ParseResource)
+	if err != nil {
+		r.handleReconciliationError(ctx, log, orchestrator, err, utils.ReconcileFailed, "Failed to get reconcile serviceAccount")
+>>>>>>> f7cb3c7 (Second round of function standardization (#607))
+		return ctrl.Result{}, err
+	}
+
+	clusterRoleBinding := &rbacv1.ClusterRoleBinding{}
+	err = r.Get(ctx, types.NamespacedName{Name: getClusterRoleName(orchestrator), Namespace: orchestrator.Namespace}, clusterRoleBinding)
 	if err != nil && errors.IsNotFound(err) {
+<<<<<<< HEAD
 		clusterRoleBinding := r.createClusterRoleBinding(orchestrator, serviceAccountName)
 		log.Info("Creating a new ClusterRoleBinding", "clusterRoleBinding.Namespace", clusterRoleBinding.Namespace, "clusterRoleBinding.Name", clusterRoleBinding.Name)
 		err = r.Create(ctx, clusterRoleBinding)
@@ -217,6 +255,13 @@ func (r *GuardrailsOrchestratorReconciler) Reconcile(ctx context.Context, req ct
 		}
 	} else if err != nil {
 		log.Error(err, "Failed to get ClusterRoleBinding")
+=======
+		clusterRoleBinding = r.createClusterRoleBinding(orchestrator, orchestrator.GetName())
+	}
+	err = utils.ReconcileClusterRoleBinding(ctx, r.Client, clusterRoleBinding)
+	if err != nil {
+		r.handleReconciliationError(ctx, log, orchestrator, err, utils.ReconcileFailed, "Failed to reconcile ClusterRoleBinding")
+>>>>>>> f7cb3c7 (Second round of function standardization (#607))
 		return ctrl.Result{}, err
 	}
 
@@ -245,6 +290,10 @@ func (r *GuardrailsOrchestratorReconciler) Reconcile(ctx context.Context, req ct
 		if err != nil {
 			log.Error(err, "Failed to get existing ConfigMap", "ConfigMap.Name", *orchestrator.Spec.OrchestratorConfig, "ConfigMap.Namespace", orchestrator.Namespace)
 			if client.IgnoreNotFound(err) != nil {
+<<<<<<< HEAD
+=======
+				r.handleReconciliationErrorWithTrace(ctx, log, orchestrator, err, utils.ReconcileFailed, "Failed to get existing ConfigMap", "ConfigMap.Name", *orchestrator.Spec.OrchestratorConfig, "ConfigMap.Namespace", orchestrator.Namespace)
+>>>>>>> f7cb3c7 (Second round of function standardization (#607))
 				return ctrl.Result{}, err
 			}
 			return ctrl.Result{}, nil
@@ -262,7 +311,11 @@ func (r *GuardrailsOrchestratorReconciler) Reconcile(ctx context.Context, req ct
 		// Create a new deployment
 		deployment, err := r.createDeployment(ctx, orchestrator)
 		if err != nil {
+<<<<<<< HEAD
 			log.Error(err, "Failed to create Deployment", "Deployment", orchestrator.Name, "Namespace", orchestrator.Namespace)
+=======
+			r.handleReconciliationErrorWithTrace(ctx, log, orchestrator, err, utils.ReconcileFailed, "Failed to create Deployment", "Deployment", orchestrator.Name, "Namespace", orchestrator.Namespace)
+>>>>>>> f7cb3c7 (Second round of function standardization (#607))
 			return ctrl.Result{}, err
 		}
 
@@ -273,7 +326,11 @@ func (r *GuardrailsOrchestratorReconciler) Reconcile(ctx context.Context, req ct
 				log.Info("Could not find required TLS serving secrets, will try again.")
 				return ctrl.Result{}, nil
 			}
+<<<<<<< HEAD
 			log.Error(err, "Failed to add TLS Mounts")
+=======
+			r.handleReconciliationError(ctx, log, orchestrator, err, utils.ReconcileFailed, "Failed to add TLS Mounts")
+>>>>>>> f7cb3c7 (Second round of function standardization (#607))
 			return ctrl.Result{}, err
 		}
 
@@ -289,11 +346,19 @@ func (r *GuardrailsOrchestratorReconciler) Reconcile(ctx context.Context, req ct
 
 		err = r.Create(ctx, deployment)
 		if err != nil {
+<<<<<<< HEAD
 			log.Error(err, "Failed to create new Deployment", "Deployment.Namespace", deployment.Namespace, "Deployment.Name", deployment.Name)
 			return ctrl.Result{}, err
 		}
 	} else if err != nil {
 		log.Error(err, "Failed to get Deployment")
+=======
+			r.handleReconciliationErrorWithTrace(ctx, log, orchestrator, err, utils.ReconcileFailed, "Failed to create new Deployment", "Deployment.Namespace", deployment.Namespace, "Deployment.Name", deployment.Name)
+			return ctrl.Result{}, err
+		}
+	} else if err != nil {
+		r.handleReconciliationError(ctx, log, orchestrator, err, utils.ReconcileFailed, "Failed to get Deployment")
+>>>>>>> f7cb3c7 (Second round of function standardization (#607))
 		return ctrl.Result{}, err
 	}
 
@@ -304,6 +369,7 @@ func (r *GuardrailsOrchestratorReconciler) Reconcile(ctx context.Context, req ct
 		}
 	}
 
+<<<<<<< HEAD
 	existingService := &corev1.Service{}
 	err = r.Get(ctx, types.NamespacedName{Name: orchestrator.Name + "-service", Namespace: orchestrator.Namespace}, existingService)
 	if err != nil && errors.IsNotFound(err) {
@@ -317,6 +383,11 @@ func (r *GuardrailsOrchestratorReconciler) Reconcile(ctx context.Context, req ct
 		}
 	} else if err != nil {
 		log.Error(err, "Failed to get Service")
+=======
+	err = utils.ReconcileService(ctx, r.Client, orchestrator, getServiceConfig(orchestrator), serviceTemplatePath, templateParser.ParseResource)
+	if err != nil {
+		r.handleReconciliationError(ctx, log, orchestrator, err, utils.ReconcileFailed, "Failed to reconcile service")
+>>>>>>> f7cb3c7 (Second round of function standardization (#607))
 		return ctrl.Result{}, err
 	}
 
@@ -365,20 +436,24 @@ func (r *GuardrailsOrchestratorReconciler) Reconcile(ctx context.Context, req ct
 =======
 	_, _, err = utils.ReconcileConfigMap(ctx, r.Client, orchestrator, orchestrator.Name+"-ca-bundle", "", "ca-bundle-configmap.tmpl.yaml", templateParser.ParseResource)
 	if err != nil {
-		r.handleReconciliationError(ctx, log, orchestrator, err, ReconcileFailed, "CA Bundle ConfigMap reconciliation failed")
+		r.handleReconciliationError(ctx, log, orchestrator, err, utils.ReconcileFailed, "CA Bundle ConfigMap reconciliation failed")
 		return ctrl.Result{}, err
 	}
 
 	err = r.reconcileOrchestratorRoute(ctx, orchestrator)
 	if err != nil {
-		r.handleReconciliationError(ctx, log, orchestrator, err, ReconcileFailed, "Main orchestrator route reconciliation failed")
+		r.handleReconciliationError(ctx, log, orchestrator, err, utils.ReconcileFailed, "Main orchestrator route reconciliation failed")
 		return ctrl.Result{}, err
 	}
 
 	err = r.reconcileHealthRoute(ctx, orchestrator)
 	if err != nil {
+<<<<<<< HEAD
 		r.handleReconciliationError(ctx, log, orchestrator, err, ReconcileFailed, "Health route reconciliation failed")
 >>>>>>> b3ba151 (Cleanup: Generalize configmap and route creation, reconciliation functions (#601))
+=======
+		r.handleReconciliationError(ctx, log, orchestrator, err, utils.ReconcileFailed, "Health route reconciliation failed")
+>>>>>>> f7cb3c7 (Second round of function standardization (#607))
 		return ctrl.Result{}, err
 	}
 
@@ -398,7 +473,7 @@ func (r *GuardrailsOrchestratorReconciler) Reconcile(ctx context.Context, req ct
 =======
 		err = r.reconcileGatewayRoute(ctx, orchestrator)
 		if err != nil {
-			r.handleReconciliationError(ctx, log, orchestrator, err, ReconcileFailed, "Gateway route reconciliation failed")
+			r.handleReconciliationError(ctx, log, orchestrator, err, utils.ReconcileFailed, "Gateway route reconciliation failed")
 			return ctrl.Result{}, err
 		}
 	}
@@ -412,22 +487,26 @@ func (r *GuardrailsOrchestratorReconciler) Reconcile(ctx context.Context, req ct
 			log.Info("Creating a new Service Monitor", "ServiceMonitor.Namespace", serviceMonitor.Namespace, "ServiceMonitor.Name", serviceMonitor.Name)
 			err = r.Create(ctx, serviceMonitor)
 			if err != nil {
-				r.handleReconciliationErrorWithTrace(ctx, log, orchestrator, err, ReconcileFailed, "Failed to create new ServiceMonitor", "ServiceMonitor.Namespace", serviceMonitor.Namespace, "ServiceMonitor.Name", serviceMonitor.Name)
+				r.handleReconciliationErrorWithTrace(ctx, log, orchestrator, err, utils.ReconcileFailed, "Failed to create new ServiceMonitor", "ServiceMonitor.Namespace", serviceMonitor.Namespace, "ServiceMonitor.Name", serviceMonitor.Name)
 			}
 		} else if err != nil {
-			r.handleReconciliationError(ctx, log, orchestrator, err, ReconcileFailed, "Failed to get ServiceMonitor")
+			r.handleReconciliationError(ctx, log, orchestrator, err, utils.ReconcileFailed, "Failed to get ServiceMonitor")
 			return ctrl.Result{}, err
 		}
 	} else {
 		if err == nil {
 			log.Info("Deleting ServiceMonitor because EnableBuiltInDetectors is false", "ServiceMonitor.Namespace", existingSM.Namespace, "ServiceMonitor.Name", existingSM.Name)
 			if delErr := r.Delete(ctx, existingSM); delErr != nil && !errors.IsNotFound(delErr) {
-				r.handleReconciliationErrorWithTrace(ctx, log, orchestrator, delErr, ReconcileFailed, "Failed to delete ServiceMonitor", "ServiceMonitor.Namespace", existingSM.Namespace, "ServiceMonitor.Name", existingSM.Name)
+				r.handleReconciliationErrorWithTrace(ctx, log, orchestrator, delErr, utils.ReconcileFailed, "Failed to delete ServiceMonitor", "ServiceMonitor.Namespace", existingSM.Namespace, "ServiceMonitor.Name", existingSM.Name)
 				return ctrl.Result{}, delErr
 			}
 		} else if err != nil && !errors.IsNotFound(err) {
+<<<<<<< HEAD
 			r.handleReconciliationError(ctx, log, orchestrator, err, ReconcileFailed, "Failed to get ServiceMonitor for deletion")
 >>>>>>> b3ba151 (Cleanup: Generalize configmap and route creation, reconciliation functions (#601))
+=======
+			r.handleReconciliationError(ctx, log, orchestrator, err, utils.ReconcileFailed, "Failed to get ServiceMonitor for deletion")
+>>>>>>> f7cb3c7 (Second round of function standardization (#607))
 			return ctrl.Result{}, err
 		}
 	}
