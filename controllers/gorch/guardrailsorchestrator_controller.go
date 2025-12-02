@@ -235,7 +235,7 @@ func (r *GuardrailsOrchestratorReconciler) Reconcile(ctx context.Context, req ct
 		}
 	}
 
-	err = utils.ReconcileServiceAccount(ctx, r.Client, orchestrator, orchestrator.Name+"-serviceaccount", serviceAccountTemplatePath, templateParser.ParseResource)
+	err = utils.ReconcileServiceAccount(ctx, r.Client, orchestrator, getServiceAccountName(orchestrator), serviceAccountTemplatePath, templateParser.ParseResource)
 	if err != nil {
 		r.handleReconciliationError(ctx, log, orchestrator, err, utils.ReconcileFailed, "Failed to get reconcile serviceAccount")
 >>>>>>> f7cb3c7 (Second round of function standardization (#607))
@@ -245,6 +245,7 @@ func (r *GuardrailsOrchestratorReconciler) Reconcile(ctx context.Context, req ct
 	clusterRoleBinding := &rbacv1.ClusterRoleBinding{}
 	err = r.Get(ctx, types.NamespacedName{Name: getClusterRoleName(orchestrator), Namespace: orchestrator.Namespace}, clusterRoleBinding)
 	if err != nil && errors.IsNotFound(err) {
+<<<<<<< HEAD
 <<<<<<< HEAD
 		clusterRoleBinding := r.createClusterRoleBinding(orchestrator, serviceAccountName)
 		log.Info("Creating a new ClusterRoleBinding", "clusterRoleBinding.Namespace", clusterRoleBinding.Namespace, "clusterRoleBinding.Name", clusterRoleBinding.Name)
@@ -257,6 +258,9 @@ func (r *GuardrailsOrchestratorReconciler) Reconcile(ctx context.Context, req ct
 		log.Error(err, "Failed to get ClusterRoleBinding")
 =======
 		clusterRoleBinding = r.createClusterRoleBinding(orchestrator, orchestrator.GetName())
+=======
+		clusterRoleBinding = r.createClusterRoleBinding(orchestrator)
+>>>>>>> 24d9004 (Fix serviceaccount name in cluster role (#613))
 	}
 	err = utils.ReconcileClusterRoleBinding(ctx, r.Client, clusterRoleBinding)
 	if err != nil {
