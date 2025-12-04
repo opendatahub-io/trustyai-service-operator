@@ -23,7 +23,7 @@ spec:
   - name: revision
     value: '{{revision}}'
   - name: output-image
-    value: quay.io/redhat-user-workloads/open-data-hub-tenant/odh-ta-lmes-driver-poc:{{revision}}
+    value: quay.io/opendatahub/ta-lmes-driver:odh-stable
   - name: dockerfile
     value: Dockerfile.driver
   - name: path-context
