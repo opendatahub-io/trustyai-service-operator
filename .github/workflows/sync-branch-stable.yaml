@@ -6,6 +6,7 @@ on:
 
 jobs:
   sync-branches:
+    if: ${{ github.repository == 'opendatahub-io/trustyai-service-operator' }}
     runs-on: ubuntu-latest
     name: Syncing branch stable
     steps:
