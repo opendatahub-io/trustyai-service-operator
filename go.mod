@@ -9,7 +9,7 @@ require (
 	github.com/openshift/api v0.0.0-20200713203337-b2494ecb17dd
 	github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring v0.64.1
 	github.com/spf13/viper v1.19.0
-	github.com/stretchr/testify v1.10.0
+	github.com/stretchr/testify v1.11.1
 	google.golang.org/grpc v1.64.1 // indirect
 	google.golang.org/protobuf v1.36.5 // indirect
 	k8s.io/api v0.29.2
@@ -48,7 +48,7 @@ require (
 	go.opentelemetry.io/otel/trace v1.24.0 // indirect
 	golang.org/x/exp v0.0.0-20231110203233-9a3e6036ecaa // indirect
 	golang.org/x/sync v0.12.0 // indirect
-	gopkg.in/ini.v1 v1.67.0 // indirect
+	gopkg.in/ini.v1 v1.67.1 // indirect
 	k8s.io/apiserver v0.29.1 // indirect
 	sigs.k8s.io/jobset v0.3.1 // indirect
 )
