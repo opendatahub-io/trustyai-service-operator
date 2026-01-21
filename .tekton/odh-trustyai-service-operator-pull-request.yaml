@@ -13,7 +13,7 @@ metadata:
   creationTimestamp: null
   labels:
     appstudio.openshift.io/application: opendatahub-builds
-    appstudio.openshift.io/component: odh-trustyai-service-operator
+    appstudio.openshift.io/component: odh-trustyai-service-operator-ci
     pipelines.appstudio.openshift.io/type: build
   name: odh-trustyai-service-operator-on-pull-request
   namespace: open-data-hub-tenant
