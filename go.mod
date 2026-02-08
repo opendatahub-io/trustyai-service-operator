@@ -1,6 +1,6 @@
 module github.com/trustyai-explainability/trustyai-service-operator
 
-go 1.23.0
+go 1.24.0
 
 require (
 	github.com/kserve/kserve v0.12.1
@@ -104,7 +104,7 @@ require (
 	go.uber.org/zap v1.27.0 // indirect
 	golang.org/x/crypto v0.35.0 // indirect
 	golang.org/x/net v0.37.0 // indirect
-	golang.org/x/oauth2 v0.18.0 // indirect
+	golang.org/x/oauth2 v0.35.0 // indirect
 	golang.org/x/sys v0.31.0 // indirect
 	golang.org/x/term v0.29.0 // indirect
 	golang.org/x/text v0.23.0 // indirect
@@ -144,7 +144,7 @@ replace (
 	// This dependency was removed from apimachinery 0.27.0
 	// k8s.io/apimachinery => k8s.io/apimachinery v0.27.0
 
-	golang.org/x/oauth2 => golang.org/x/oauth2 v0.27.0
+	golang.org/x/oauth2 => golang.org/x/oauth2 v0.35.0
 )
 
 exclude github.com/openshift/api v3.9.0+incompatible
