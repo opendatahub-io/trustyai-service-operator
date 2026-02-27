@@ -42,6 +42,11 @@ var _ = Describe("EvalHub Controller", func() {
 		configMap = createConfigMap(configMapName, testNamespace)
 		Expect(k8sClient.Create(ctx, configMap)).Should(Succeed())
 
+		// Create source provider ConfigMaps (needed because the CRD default populates providers)
+		for _, cm := range createDefaultProviderConfigMaps(testNamespace) {
+			Expect(k8sClient.Create(ctx, cm)).Should(Succeed())
+		}
+
 		// Create EvalHub instance
 		evalHub = createEvalHubInstance(evalHubName, testNamespace)
 		Expect(k8sClient.Create(ctx, evalHub)).Should(Succeed())
@@ -180,6 +185,11 @@ var _ = Describe("EvalHub Lifecycle Integration", func() {
 		configMap = createConfigMap(configMapName, testNamespace)
 		Expect(k8sClient.Create(ctx, configMap)).Should(Succeed())
 
+		// Create source provider ConfigMaps (needed because the CRD default populates providers)
+		for _, cm := range createDefaultProviderConfigMaps(testNamespace) {
+			Expect(k8sClient.Create(ctx, cm)).Should(Succeed())
+		}
+
 		// Create EvalHub instance
 		evalHub = createEvalHubInstance(evalHubName, testNamespace)
 		Expect(k8sClient.Create(ctx, evalHub)).Should(Succeed())
@@ -219,7 +229,6 @@ var _ = Describe("EvalHub Lifecycle Integration", func() {
 		By("Checking that ConfigMap is created")
 		configMapCreated := waitForConfigMap(evalHubName+"-config", testNamespace)
 		Expect(configMapCreated.Data).To(HaveKey("config.yaml"))
-		Expect(configMapCreated.Data).To(HaveKey("providers.yaml"))
 
 		By("Checking that Deployment is created")
 		deployment := waitForDeployment(evalHubName, testNamespace)

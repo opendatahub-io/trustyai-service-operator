@@ -18,7 +18,7 @@ import (
 )
 
 // reconcileDeployment creates or updates the Deployment for EvalHub
-func (r *EvalHubReconciler) reconcileDeployment(ctx context.Context, instance *evalhubv1alpha1.EvalHub) error {
+func (r *EvalHubReconciler) reconcileDeployment(ctx context.Context, instance *evalhubv1alpha1.EvalHub, providerCMNames []string) error {
 	log := log.FromContext(ctx)
 	log.Info("Reconciling Deployment", "name", instance.Name)
 
@@ -36,7 +36,7 @@ func (r *EvalHubReconciler) reconcileDeployment(ctx context.Context, instance *e
 	}
 
 	// Define the desired deployment spec
-	desiredSpec, err := r.buildDeploymentSpec(ctx, instance)
+	desiredSpec, err := r.buildDeploymentSpec(ctx, instance, providerCMNames)
 	if err != nil {
 		return err
 	}
@@ -61,7 +61,7 @@ func (r *EvalHubReconciler) reconcileDeployment(ctx context.Context, instance *e
 }
 
 // buildDeploymentSpec builds the deployment specification for EvalHub
-func (r *EvalHubReconciler) buildDeploymentSpec(ctx context.Context, instance *evalhubv1alpha1.EvalHub) (appsv1.DeploymentSpec, error) {
+func (r *EvalHubReconciler) buildDeploymentSpec(ctx context.Context, instance *evalhubv1alpha1.EvalHub, providerCMNames []string) (appsv1.DeploymentSpec, error) {
 	labels := map[string]string{
 		"app":       "eval-hub",
 		"instance":  instance.Name,
@@ -104,12 +104,8 @@ func (r *EvalHubReconciler) buildDeploymentSpec(ctx context.Context, instance *e
 			Value: "3",
 		},
 		{
-			Name:  "CONFIG_PATH",
-			Value: "/etc/evalhub/config.yaml",
-		},
-		{
-			Name:  "PROVIDERS_CONFIG_PATH",
-			Value: "/etc/evalhub/providers.yaml",
+			Name:  "EVAL_HUB_CONFIG_DIR",
+			Value: configDirPath,
 		},
 		{
 			Name:  "SERVICE_URL",
@@ -140,7 +136,7 @@ func (r *EvalHubReconciler) buildDeploymentSpec(ctx context.Context, instance *e
 	volumeMounts := []corev1.VolumeMount{
 		{
 			Name:      "evalhub-config",
-			MountPath: "/etc/evalhub",
+			MountPath: configDirPath,
 			ReadOnly:  true,
 		},
 		{
@@ -153,6 +149,13 @@ func (r *EvalHubReconciler) buildDeploymentSpec(ctx context.Context, instance *e
 			MountPath: mlflowTokenMountPath,
 			ReadOnly:  true,
 		},
+	}
+	if len(providerCMNames) > 0 {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      providersVolumeName,
+			MountPath: providersMountPath,
+			ReadOnly:  true,
+		})
 	}
 	if instance.Spec.IsDatabaseConfigured() {
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{
@@ -342,6 +345,16 @@ func (r *EvalHubReconciler) buildDeploymentSpec(ctx context.Context, instance *e
 				},
 			},
 		},
+	}
+	if len(providerCMNames) > 0 {
+		volumes = append(volumes, corev1.Volume{
+			Name: providersVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				Projected: &corev1.ProjectedVolumeSource{
+					Sources: providerVolumeProjections(providerCMNames),
+				},
+			},
+		})
 	}
 	if instance.Spec.IsDatabaseConfigured() {
 		volumes = append(volumes, corev1.Volume{

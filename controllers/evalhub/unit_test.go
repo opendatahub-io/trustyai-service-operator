@@ -73,7 +73,7 @@ func TestEvalHubReconciler_reconcileDeployment(t *testing.T) {
 	}
 
 	t.Run("should create deployment with correct spec", func(t *testing.T) {
-		err := reconciler.reconcileDeployment(ctx, evalHub)
+		err := reconciler.reconcileDeployment(ctx, evalHub, nil)
 		require.NoError(t, err)
 
 		// Verify deployment was created
@@ -154,7 +154,7 @@ func TestEvalHubReconciler_reconcileDeployment(t *testing.T) {
 			EventRecorder: record.NewFakeRecorder(10),
 		}
 
-		err := reconcilerNoConfig.reconcileDeployment(ctx, evalHub)
+		err := reconcilerNoConfig.reconcileDeployment(ctx, evalHub, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "kube-rbac-proxy configuration error")
 	})
@@ -266,33 +266,11 @@ func TestEvalHubReconciler_reconcileConfigMap(t *testing.T) {
 
 		// Check data keys exist
 		assert.Contains(t, configMap.Data, "config.yaml")
-		assert.Contains(t, configMap.Data, "providers.yaml")
 
 		// Parse and validate config.yaml
 		var config EvalHubConfig
 		err = yaml.Unmarshal([]byte(configMap.Data["config.yaml"]), &config)
 		require.NoError(t, err)
-
-		// Check providers
-		assert.Len(t, config.Providers, 4)
-		providerNames := make([]string, len(config.Providers))
-		for i, provider := range config.Providers {
-			providerNames[i] = provider.Name
-		}
-		assert.Contains(t, providerNames, "lm-eval-harness")
-		assert.Contains(t, providerNames, "ragas-provider")
-		assert.Contains(t, providerNames, "garak-security")
-		assert.Contains(t, providerNames, "trustyai-custom")
-
-		// Check collections
-		assert.Contains(t, config.Collections, "healthcare_safety_v1")
-		assert.Contains(t, config.Collections, "automotive_safety_v1")
-
-		// Parse and validate providers.yaml
-		var providersData map[string]interface{}
-		err = yaml.Unmarshal([]byte(configMap.Data["providers.yaml"]), &providersData)
-		require.NoError(t, err)
-		assert.Contains(t, providersData, "providers")
 	})
 }
 
@@ -428,35 +406,11 @@ func TestGenerateConfigData(t *testing.T) {
 
 		// Check keys exist
 		assert.Contains(t, configData, "config.yaml")
-		assert.Contains(t, configData, "providers.yaml")
 
 		// Parse config.yaml
 		var config EvalHubConfig
 		err = yaml.Unmarshal([]byte(configData["config.yaml"]), &config)
 		require.NoError(t, err)
-
-		// Verify default providers
-		assert.Len(t, config.Providers, 4)
-
-		// Find lm-eval-harness provider
-		var lmEvalProvider *ProviderConfig
-		for _, provider := range config.Providers {
-			if provider.Name == "lm-eval-harness" {
-				lmEvalProvider = &provider
-				break
-			}
-		}
-		require.NotNil(t, lmEvalProvider)
-		assert.Equal(t, "lm_evaluation_harness", lmEvalProvider.Type)
-		assert.True(t, lmEvalProvider.Enabled)
-		assert.Contains(t, lmEvalProvider.Benchmarks, "arc_challenge")
-		assert.Equal(t, "8", lmEvalProvider.Config["batch_size"])
-
-		// Verify collections
-		assert.Contains(t, config.Collections, "healthcare_safety_v1")
-		assert.Contains(t, config.Collections, "automotive_safety_v1")
-		assert.Contains(t, config.Collections, "finance_compliance_v1")
-		assert.Contains(t, config.Collections, "general_llm_eval_v1")
 	})
 }
 
@@ -1188,7 +1142,7 @@ func TestGenerateConfigData_WithDatabase(t *testing.T) {
 		assert.Equal(t, 10, config.Database.MaxIdleConns)
 	})
 
-	t.Run("should omit database and secrets sections when DB not configured", func(t *testing.T) {
+	t.Run("should default to sqlite when DB not explicitly configured", func(t *testing.T) {
 		evalHub := &evalhubv1alpha1.EvalHub{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-evalhub",
@@ -1204,8 +1158,110 @@ func TestGenerateConfigData_WithDatabase(t *testing.T) {
 		err = yaml.Unmarshal([]byte(configData["config.yaml"]), &config)
 		require.NoError(t, err)
 
-		assert.Nil(t, config.Database)
+		assert.NotNil(t, config.Database)
+		assert.Equal(t, "sqlite", config.Database.Driver)
 		assert.Nil(t, config.Secrets)
+	})
+}
+
+func TestGenerateConfigData_WithOTEL(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, evalhubv1alpha1.AddToScheme(scheme))
+
+	t.Run("should include otel section when configured", func(t *testing.T) {
+		evalHub := &evalhubv1alpha1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-evalhub",
+				Namespace: "test-namespace",
+			},
+			Spec: evalhubv1alpha1.EvalHubSpec{
+				Otel: &evalhubv1alpha1.OTELSpec{
+					ExporterType:     "otlp-grpc",
+					ExporterEndpoint: "otel-collector:4317",
+					ExporterInsecure: true,
+					SamplingRatio:    "0.5",
+					EnableTracing:    true,
+					EnableMetrics:    true,
+					EnableLogs:       false,
+				},
+			},
+		}
+
+		reconciler := &EvalHubReconciler{Scheme: scheme}
+		configData, err := reconciler.generateConfigData(evalHub)
+		require.NoError(t, err)
+
+		var config EvalHubConfig
+		err = yaml.Unmarshal([]byte(configData["config.yaml"]), &config)
+		require.NoError(t, err)
+
+		require.NotNil(t, config.OTEL)
+		assert.True(t, config.OTEL.Enabled)
+		assert.Equal(t, "otlp-grpc", config.OTEL.ExporterType)
+		assert.Equal(t, "otel-collector:4317", config.OTEL.ExporterEndpoint)
+		assert.True(t, config.OTEL.ExporterInsecure)
+		require.NotNil(t, config.OTEL.SamplingRatio)
+		assert.Equal(t, 0.5, *config.OTEL.SamplingRatio)
+		assert.True(t, config.OTEL.EnableTracing)
+		assert.True(t, config.OTEL.EnableMetrics)
+		assert.False(t, config.OTEL.EnableLogs)
+	})
+
+	t.Run("should use custom values", func(t *testing.T) {
+		evalHub := &evalhubv1alpha1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-evalhub",
+				Namespace: "test-namespace",
+			},
+			Spec: evalhubv1alpha1.EvalHubSpec{
+				Otel: &evalhubv1alpha1.OTELSpec{
+					ExporterType:     "otlp-http",
+					ExporterEndpoint: "https://tempo.example.com:4318",
+					ExporterInsecure: false,
+					SamplingRatio:    "0.1",
+					EnableTracing:    true,
+					EnableMetrics:    false,
+					EnableLogs:       true,
+				},
+			},
+		}
+
+		reconciler := &EvalHubReconciler{Scheme: scheme}
+		configData, err := reconciler.generateConfigData(evalHub)
+		require.NoError(t, err)
+
+		var config EvalHubConfig
+		err = yaml.Unmarshal([]byte(configData["config.yaml"]), &config)
+		require.NoError(t, err)
+
+		require.NotNil(t, config.OTEL)
+		assert.Equal(t, "otlp-http", config.OTEL.ExporterType)
+		assert.Equal(t, "https://tempo.example.com:4318", config.OTEL.ExporterEndpoint)
+		assert.False(t, config.OTEL.ExporterInsecure)
+		require.NotNil(t, config.OTEL.SamplingRatio)
+		assert.Equal(t, 0.1, *config.OTEL.SamplingRatio)
+		assert.True(t, config.OTEL.EnableTracing)
+		assert.False(t, config.OTEL.EnableMetrics)
+		assert.True(t, config.OTEL.EnableLogs)
+	})
+
+	t.Run("should omit otel section when not configured", func(t *testing.T) {
+		evalHub := &evalhubv1alpha1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-evalhub",
+				Namespace: "test-namespace",
+			},
+		}
+
+		reconciler := &EvalHubReconciler{Scheme: scheme}
+		configData, err := reconciler.generateConfigData(evalHub)
+		require.NoError(t, err)
+
+		var config EvalHubConfig
+		err = yaml.Unmarshal([]byte(configData["config.yaml"]), &config)
+		require.NoError(t, err)
+
+		assert.Nil(t, config.OTEL)
 	})
 }
 
@@ -1256,7 +1312,7 @@ func TestEvalHubReconciler_reconcileDeployment_WithDB(t *testing.T) {
 	}
 
 	t.Run("should add DB secret volume and mount when database configured", func(t *testing.T) {
-		err := reconciler.reconcileDeployment(ctx, evalHub)
+		err := reconciler.reconcileDeployment(ctx, evalHub, nil)
 		require.NoError(t, err)
 
 		deployment := &appsv1.Deployment{}
@@ -1328,5 +1384,214 @@ func TestEvalHubHelperMethods_IsDatabaseConfigured(t *testing.T) {
 			},
 		}
 		assert.True(t, spec.IsDatabaseConfigured())
+	})
+}
+
+func TestEvalHubReconciler_reconcileProviderConfigMaps(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, appsv1.AddToScheme(scheme))
+	require.NoError(t, evalhubv1alpha1.AddToScheme(scheme))
+
+	ctx := context.Background()
+	operatorNamespace := "operator-ns"
+	instanceNamespace := "instance-ns"
+	evalHubName := "test-evalhub"
+
+	// Source provider ConfigMap in the operator namespace (simulates what kustomize deploys)
+	sourceProvider := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "trustyai-service-operator-evalhub-provider-testprovider",
+			Namespace: operatorNamespace,
+			Labels: map[string]string{
+				providerLabel:     "system",
+				providerNameLabel: "testprovider",
+			},
+		},
+		Data: map[string]string{
+			"testprovider.yaml": "id: testprovider\nname: Test Provider\nruntime:\n  k8s:\n    image: quay.io/test/provider:latest\n",
+		},
+	}
+
+	t.Run("should copy provider ConfigMap to instance namespace", func(t *testing.T) {
+		evalHub := &evalhubv1alpha1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      evalHubName,
+				Namespace: instanceNamespace,
+			},
+			Spec: evalhubv1alpha1.EvalHubSpec{
+				Providers: []string{"testprovider"},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub, sourceProvider).
+			Build()
+
+		reconciler := &EvalHubReconciler{
+			Client:        fakeClient,
+			Scheme:        scheme,
+			Namespace:     operatorNamespace,
+			EventRecorder: record.NewFakeRecorder(10),
+		}
+
+		cmNames, err := reconciler.reconcileProviderConfigMaps(ctx, evalHub)
+		require.NoError(t, err)
+
+		// Should return the target ConfigMap name
+		require.Len(t, cmNames, 1)
+		assert.Equal(t, evalHubName+"-provider-testprovider", cmNames[0])
+
+		// Verify the ConfigMap was created in the instance namespace with correct data
+		copiedCM := &corev1.ConfigMap{}
+		err = fakeClient.Get(ctx, types.NamespacedName{
+			Name:      evalHubName + "-provider-testprovider",
+			Namespace: instanceNamespace,
+		}, copiedCM)
+		require.NoError(t, err)
+		assert.Equal(t, sourceProvider.Data["testprovider.yaml"], copiedCM.Data["testprovider.yaml"])
+	})
+
+	t.Run("should return nil when no providers specified", func(t *testing.T) {
+		evalHub := &evalhubv1alpha1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      evalHubName,
+				Namespace: instanceNamespace,
+			},
+			Spec: evalhubv1alpha1.EvalHubSpec{},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub).
+			Build()
+
+		reconciler := &EvalHubReconciler{
+			Client:        fakeClient,
+			Scheme:        scheme,
+			Namespace:     operatorNamespace,
+			EventRecorder: record.NewFakeRecorder(10),
+		}
+
+		cmNames, err := reconciler.reconcileProviderConfigMaps(ctx, evalHub)
+		require.NoError(t, err)
+		assert.Nil(t, cmNames)
+	})
+
+	t.Run("should error when provider not found", func(t *testing.T) {
+		evalHub := &evalhubv1alpha1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      evalHubName,
+				Namespace: instanceNamespace,
+			},
+			Spec: evalhubv1alpha1.EvalHubSpec{
+				Providers: []string{"nonexistent"},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub).
+			Build()
+
+		reconciler := &EvalHubReconciler{
+			Client:        fakeClient,
+			Scheme:        scheme,
+			Namespace:     operatorNamespace,
+			EventRecorder: record.NewFakeRecorder(10),
+		}
+
+		cmNames, err := reconciler.reconcileProviderConfigMaps(ctx, evalHub)
+		require.Error(t, err)
+		assert.Nil(t, cmNames)
+		assert.Contains(t, err.Error(), "not found")
+	})
+
+	t.Run("should mount providers as projected volume in deployment", func(t *testing.T) {
+		evalHub := &evalhubv1alpha1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      evalHubName,
+				Namespace: instanceNamespace,
+			},
+			Spec: evalhubv1alpha1.EvalHubSpec{
+				Providers: []string{"testprovider"},
+			},
+		}
+
+		operatorConfigMap := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      configMapName,
+				Namespace: operatorNamespace,
+			},
+			Data: map[string]string{
+				configMapEvalHubImageKey:       "quay.io/test/eval-hub:latest",
+				configMapKubeRBACProxyImageKey: "gcr.io/kubebuilder/kube-rbac-proxy:v0.13.1",
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub, sourceProvider, operatorConfigMap).
+			Build()
+
+		reconciler := &EvalHubReconciler{
+			Client:        fakeClient,
+			Scheme:        scheme,
+			Namespace:     operatorNamespace,
+			EventRecorder: record.NewFakeRecorder(10),
+		}
+
+		// First reconcile provider ConfigMaps
+		cmNames, err := reconciler.reconcileProviderConfigMaps(ctx, evalHub)
+		require.NoError(t, err)
+		require.Len(t, cmNames, 1)
+
+		// Then reconcile deployment with the provider ConfigMap names
+		err = reconciler.reconcileDeployment(ctx, evalHub, cmNames)
+		require.NoError(t, err)
+
+		// Verify the deployment has the projected volume
+		deployment := &appsv1.Deployment{}
+		err = fakeClient.Get(ctx, types.NamespacedName{
+			Name:      evalHubName,
+			Namespace: instanceNamespace,
+		}, deployment)
+		require.NoError(t, err)
+
+		// Find the evalhub-providers projected volume
+		var providersVolume *corev1.Volume
+		for i, v := range deployment.Spec.Template.Spec.Volumes {
+			if v.Name == providersVolumeName {
+				providersVolume = &deployment.Spec.Template.Spec.Volumes[i]
+				break
+			}
+		}
+		require.NotNil(t, providersVolume, "evalhub-providers volume should be present")
+		require.NotNil(t, providersVolume.VolumeSource.Projected)
+		require.Len(t, providersVolume.VolumeSource.Projected.Sources, 1)
+		assert.Equal(t, evalHubName+"-provider-testprovider",
+			providersVolume.VolumeSource.Projected.Sources[0].ConfigMap.Name)
+
+		// Find the providers volume mount on the evalhub container
+		var evalHubContainer *corev1.Container
+		for i, c := range deployment.Spec.Template.Spec.Containers {
+			if c.Name == containerName {
+				evalHubContainer = &deployment.Spec.Template.Spec.Containers[i]
+				break
+			}
+		}
+		require.NotNil(t, evalHubContainer)
+
+		var providersMount *corev1.VolumeMount
+		for i, m := range evalHubContainer.VolumeMounts {
+			if m.Name == providersVolumeName {
+				providersMount = &evalHubContainer.VolumeMounts[i]
+				break
+			}
+		}
+		require.NotNil(t, providersMount, "providers volume mount should be present")
+		assert.Equal(t, providersMountPath, providersMount.MountPath)
+		assert.True(t, providersMount.ReadOnly)
 	})
 }

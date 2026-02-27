@@ -49,6 +49,15 @@ const (
 	mlflowTokenMountPath  = "/var/run/secrets/mlflow"
 	mlflowTokenFile       = "token"
 	mlflowTokenExpiration = 3600 // seconds
+
+	// EvalHub config directory (contains config.yaml and providers/ subdir)
+	configDirPath = "/etc/evalhub/config"
+
+	// Provider ConfigMap configuration
+	providerLabel       = "trustyai.opendatahub.io/evalhub-provider-type"
+	providerNameLabel   = "trustyai.opendatahub.io/evalhub-provider-name"
+	providersVolumeName = "evalhub-providers"
+	providersMountPath  = configDirPath + "/providers"
 )
 
 var (
