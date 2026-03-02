@@ -1,6 +1,6 @@
 module github.com/trustyai-explainability/trustyai-service-operator
 
-go 1.23.0
+go 1.24.0
 
 require (
 	github.com/kserve/kserve v0.12.1
@@ -78,7 +78,7 @@ require (
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/go-containerregistry v0.16.1 // indirect
 	github.com/google/gofuzz v1.2.0 // indirect
-	github.com/google/pprof v0.0.0-20241210010833-40e02aabc2ad // indirect
+	github.com/google/pprof v0.0.0-20260302011040-a15ffb7f9dcc // indirect
 	github.com/google/s2a-go v0.1.7 // indirect
 	github.com/google/uuid v1.6.0
 	github.com/googleapis/enterprise-certificate-proxy v0.3.2 // indirect
@@ -105,7 +105,7 @@ require (
 	golang.org/x/crypto v0.35.0 // indirect
 	golang.org/x/net v0.37.0 // indirect
 	golang.org/x/oauth2 v0.18.0 // indirect
-	golang.org/x/sys v0.31.0 // indirect
+	golang.org/x/sys v0.32.0 // indirect
 	golang.org/x/term v0.29.0 // indirect
 	golang.org/x/text v0.23.0 // indirect
 	golang.org/x/time v0.5.0 // indirect
