@@ -54,8 +54,7 @@ func TestEvalHubReconciler_reconcileDeployment(t *testing.T) {
 			Namespace: testNamespace,
 		},
 		Data: map[string]string{
-			configMapEvalHubImageKey:       "quay.io/test/eval-hub:latest",
-			configMapKubeRBACProxyImageKey: "gcr.io/kubebuilder/kube-rbac-proxy:v0.13.1",
+			configMapEvalHubImageKey: "quay.io/test/eval-hub:latest",
 		},
 	}
 
@@ -73,7 +72,7 @@ func TestEvalHubReconciler_reconcileDeployment(t *testing.T) {
 	}
 
 	t.Run("should create deployment with correct spec", func(t *testing.T) {
-		err := reconciler.reconcileDeployment(ctx, evalHub)
+		err := reconciler.reconcileDeployment(ctx, evalHub, nil)
 		require.NoError(t, err)
 
 		// Verify deployment was created
@@ -89,36 +88,27 @@ func TestEvalHubReconciler_reconcileDeployment(t *testing.T) {
 		assert.Equal(t, testNamespace, deployment.Namespace)
 		assert.Equal(t, replicas, *deployment.Spec.Replicas)
 
-		// Check container configuration
-		require.Len(t, deployment.Spec.Template.Spec.Containers, 2)
+		// Check container configuration — single container, no sidecar
+		require.Len(t, deployment.Spec.Template.Spec.Containers, 1)
 
-		// Find the evalhub container
-		var container *corev1.Container
-		for i, c := range deployment.Spec.Template.Spec.Containers {
-			if c.Name == containerName {
-				container = &deployment.Spec.Template.Spec.Containers[i]
-				break
-			}
-		}
-		require.NotNil(t, container, "evalhub container should be present")
+		container := &deployment.Spec.Template.Spec.Containers[0]
 
 		assert.Equal(t, containerName, container.Name)
 		assert.Equal(t, "quay.io/test/eval-hub:latest", container.Image)
 		assert.Equal(t, corev1.PullAlways, container.ImagePullPolicy)
 
-		// Check ports
+		// Check ports — direct TLS on 8443
 		require.Len(t, container.Ports, 1)
-		assert.Equal(t, "http", container.Ports[0].Name)
-		assert.Equal(t, int32(8080), container.Ports[0].ContainerPort)
+		assert.Equal(t, "https", container.Ports[0].Name)
+		assert.Equal(t, int32(containerPort), container.Ports[0].ContainerPort)
 
 		// Check environment variables include both default and custom
 		envVarMap := make(map[string]string)
 		for _, env := range container.Env {
 			envVarMap[env.Name] = env.Value
 		}
-		// API_HOST is 127.0.0.1 to ensure only kube-rbac-proxy can reach the API (security hardening)
-		assert.Equal(t, "127.0.0.1", envVarMap["API_HOST"])
-		assert.Equal(t, "8080", envVarMap["API_PORT"])
+		assert.Equal(t, "0.0.0.0", envVarMap["API_HOST"])
+		assert.Equal(t, "8443", envVarMap["PORT"])
 		assert.Equal(t, "test-value", envVarMap["TEST_VAR"])
 
 		// Check SERVICE_URL and EVALHUB_INSTANCE_NAME are propagated
@@ -129,18 +119,23 @@ func TestEvalHubReconciler_reconcileDeployment(t *testing.T) {
 		assert.Equal(t, resource.MustParse("500m"), container.Resources.Requests[corev1.ResourceCPU])
 		assert.Equal(t, resource.MustParse("512Mi"), container.Resources.Requests[corev1.ResourceMemory])
 
-		// Check health probes (exec-based because API listens on 127.0.0.1 only)
+		// Check health probes — HTTPGet with HTTPS scheme
 		require.NotNil(t, container.LivenessProbe)
-		require.NotNil(t, container.LivenessProbe.Exec)
-		assert.Equal(t, []string{"/usr/bin/curl", "--fail", "--silent", "--max-time", "3", "http://127.0.0.1:8080/api/v1/health"}, container.LivenessProbe.Exec.Command)
+		require.NotNil(t, container.LivenessProbe.HTTPGet)
+		assert.Equal(t, "/api/v1/health", container.LivenessProbe.HTTPGet.Path)
+		assert.Equal(t, intstr.FromInt(containerPort), container.LivenessProbe.HTTPGet.Port)
+		assert.Equal(t, corev1.URISchemeHTTPS, container.LivenessProbe.HTTPGet.Scheme)
+		assert.Equal(t, int32(30), container.LivenessProbe.InitialDelaySeconds)
 
-		// Check readiness probe matches expected exec-based curl check
 		require.NotNil(t, container.ReadinessProbe)
-		require.NotNil(t, container.ReadinessProbe.Exec)
-		assert.Equal(t, []string{"/usr/bin/curl", "--fail", "--silent", "--max-time", "2", "http://127.0.0.1:8080/api/v1/health"}, container.ReadinessProbe.Exec.Command)
+		require.NotNil(t, container.ReadinessProbe.HTTPGet)
+		assert.Equal(t, "/api/v1/health", container.ReadinessProbe.HTTPGet.Path)
+		assert.Equal(t, intstr.FromInt(containerPort), container.ReadinessProbe.HTTPGet.Port)
+		assert.Equal(t, corev1.URISchemeHTTPS, container.ReadinessProbe.HTTPGet.Scheme)
+		assert.Equal(t, int32(10), container.ReadinessProbe.InitialDelaySeconds)
 	})
 
-	t.Run("should fail when configmap missing", func(t *testing.T) {
+	t.Run("should use fallback image when configmap missing", func(t *testing.T) {
 		// Create client without configmap
 		fakeClientNoConfig := fake.NewClientBuilder().
 			WithScheme(scheme).
@@ -154,9 +149,26 @@ func TestEvalHubReconciler_reconcileDeployment(t *testing.T) {
 			EventRecorder: record.NewFakeRecorder(10),
 		}
 
-		err := reconcilerNoConfig.reconcileDeployment(ctx, evalHub)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "kube-rbac-proxy configuration error")
+		err := reconcilerNoConfig.reconcileDeployment(ctx, evalHub, nil)
+		require.NoError(t, err)
+
+		// Verify the deployment was created with default image
+		deployment := &appsv1.Deployment{}
+		err = fakeClientNoConfig.Get(ctx, types.NamespacedName{
+			Name:      evalHubName,
+			Namespace: testNamespace,
+		}, deployment)
+		require.NoError(t, err)
+
+		var container *corev1.Container
+		for i, c := range deployment.Spec.Template.Spec.Containers {
+			if c.Name == containerName {
+				container = &deployment.Spec.Template.Spec.Containers[i]
+				break
+			}
+		}
+		require.NotNil(t, container)
+		assert.Equal(t, defaultEvalHubImage, container.Image)
 	})
 }
 
@@ -266,33 +278,11 @@ func TestEvalHubReconciler_reconcileConfigMap(t *testing.T) {
 
 		// Check data keys exist
 		assert.Contains(t, configMap.Data, "config.yaml")
-		assert.Contains(t, configMap.Data, "providers.yaml")
 
 		// Parse and validate config.yaml
 		var config EvalHubConfig
 		err = yaml.Unmarshal([]byte(configMap.Data["config.yaml"]), &config)
 		require.NoError(t, err)
-
-		// Check providers
-		assert.Len(t, config.Providers, 4)
-		providerNames := make([]string, len(config.Providers))
-		for i, provider := range config.Providers {
-			providerNames[i] = provider.Name
-		}
-		assert.Contains(t, providerNames, "lm-eval-harness")
-		assert.Contains(t, providerNames, "ragas-provider")
-		assert.Contains(t, providerNames, "garak-security")
-		assert.Contains(t, providerNames, "trustyai-custom")
-
-		// Check collections
-		assert.Contains(t, config.Collections, "healthcare_safety_v1")
-		assert.Contains(t, config.Collections, "automotive_safety_v1")
-
-		// Parse and validate providers.yaml
-		var providersData map[string]interface{}
-		err = yaml.Unmarshal([]byte(configMap.Data["providers.yaml"]), &providersData)
-		require.NoError(t, err)
-		assert.Contains(t, providersData, "providers")
 	})
 }
 
@@ -409,6 +399,7 @@ func TestEvalHubReconciler_updateStatus(t *testing.T) {
 
 func TestGenerateConfigData(t *testing.T) {
 	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, evalhubv1alpha1.AddToScheme(scheme))
 
 	evalHub := &evalhubv1alpha1.EvalHub{
@@ -418,45 +409,29 @@ func TestGenerateConfigData(t *testing.T) {
 		},
 	}
 
+	configMap := createConfigMap(configMapName, evalHub.Namespace)
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(evalHub, configMap).
+		Build()
 	reconciler := &EvalHubReconciler{
-		Scheme: scheme,
+		Client:    fakeClient,
+		Scheme:    scheme,
+		Namespace: evalHub.Namespace,
 	}
 
 	t.Run("should generate valid configuration data", func(t *testing.T) {
-		configData, err := reconciler.generateConfigData(evalHub)
+		configData, err := reconciler.generateConfigData(context.Background(), evalHub)
 		require.NoError(t, err)
 
 		// Check keys exist
 		assert.Contains(t, configData, "config.yaml")
-		assert.Contains(t, configData, "providers.yaml")
 
 		// Parse config.yaml
 		var config EvalHubConfig
 		err = yaml.Unmarshal([]byte(configData["config.yaml"]), &config)
 		require.NoError(t, err)
 
-		// Verify default providers
-		assert.Len(t, config.Providers, 4)
-
-		// Find lm-eval-harness provider
-		var lmEvalProvider *ProviderConfig
-		for _, provider := range config.Providers {
-			if provider.Name == "lm-eval-harness" {
-				lmEvalProvider = &provider
-				break
-			}
-		}
-		require.NotNil(t, lmEvalProvider)
-		assert.Equal(t, "lm_evaluation_harness", lmEvalProvider.Type)
-		assert.True(t, lmEvalProvider.Enabled)
-		assert.Contains(t, lmEvalProvider.Benchmarks, "arc_challenge")
-		assert.Equal(t, "8", lmEvalProvider.Config["batch_size"])
-
-		// Verify collections
-		assert.Contains(t, config.Collections, "healthcare_safety_v1")
-		assert.Contains(t, config.Collections, "automotive_safety_v1")
-		assert.Contains(t, config.Collections, "finance_compliance_v1")
-		assert.Contains(t, config.Collections, "general_llm_eval_v1")
 	})
 }
 
@@ -506,6 +481,7 @@ func TestEvalHubHelperMethods(t *testing.T) {
 func TestEvalHubReconciler_createJobsServiceAccount(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, rbacv1.AddToScheme(scheme))
 	require.NoError(t, evalhubv1alpha1.AddToScheme(scheme))
 
 	ctx := context.Background()
@@ -531,12 +507,12 @@ func TestEvalHubReconciler_createJobsServiceAccount(t *testing.T) {
 		EventRecorder: record.NewFakeRecorder(10),
 	}
 
-	t.Run("should create jobs ServiceAccount with correct properties", func(t *testing.T) {
-		err := reconciler.createJobsServiceAccount(ctx, evalHub)
+	t.Run("should create job ServiceAccount with correct properties", func(t *testing.T) {
+		err := reconciler.createJobsServiceAccount(ctx, evalHub, testNamespace)
 		require.NoError(t, err)
 
 		// Verify ServiceAccount was created
-		jobsSAName := evalHubName + "-jobs"
+		jobsSAName := generateJobsServiceAccountName(evalHub)
 		jobsSA := &corev1.ServiceAccount{}
 		err = fakeClient.Get(ctx, types.NamespacedName{
 			Name:      jobsSAName,
@@ -548,26 +524,25 @@ func TestEvalHubReconciler_createJobsServiceAccount(t *testing.T) {
 		assert.Equal(t, jobsSAName, jobsSA.Name)
 		assert.Equal(t, testNamespace, jobsSA.Namespace)
 
-		// Check labels
+		// Check labels (used for cleanup instead of owner references)
 		assert.Equal(t, "eval-hub", jobsSA.Labels["app"])
 		assert.Equal(t, jobsSAName, jobsSA.Labels["app.kubernetes.io/name"])
 		assert.Equal(t, evalHubName, jobsSA.Labels["app.kubernetes.io/instance"])
-		assert.Equal(t, "jobs", jobsSA.Labels["app.kubernetes.io/component"])
+		assert.Equal(t, "job", jobsSA.Labels["app.kubernetes.io/component"])
+		assert.Equal(t, "trustyai-service-operator", jobsSA.Labels["app.kubernetes.io/managed-by"])
+		assert.Equal(t, jobResourceInstanceID(evalHub), jobsSA.Labels["eval-hub.trustyai.opendatahub.io"])
 
-		// Check owner reference
-		require.Len(t, jobsSA.OwnerReferences, 1)
-		assert.Equal(t, evalHubName, jobsSA.OwnerReferences[0].Name)
-		assert.Equal(t, "EvalHub", jobsSA.OwnerReferences[0].Kind)
-		assert.True(t, *jobsSA.OwnerReferences[0].Controller)
+		// No owner references — cleanup is label-based via the finalizer
+		assert.Empty(t, jobsSA.OwnerReferences)
 	})
 
 	t.Run("should be idempotent on repeated calls", func(t *testing.T) {
 		// Call again
-		err := reconciler.createJobsServiceAccount(ctx, evalHub)
+		err := reconciler.createJobsServiceAccount(ctx, evalHub, testNamespace)
 		require.NoError(t, err)
 
 		// Verify still only one ServiceAccount exists
-		jobsSAName := evalHubName + "-jobs"
+		jobsSAName := generateJobsServiceAccountName(evalHub)
 		jobsSA := &corev1.ServiceAccount{}
 		err = fakeClient.Get(ctx, types.NamespacedName{
 			Name:      jobsSAName,
@@ -577,9 +552,9 @@ func TestEvalHubReconciler_createJobsServiceAccount(t *testing.T) {
 	})
 }
 
-// TestEvalHubReconciler_createJobsProxyRoleBinding verifies that the jobs proxy RoleBinding
+// TestEvalHubReconciler_createJobsAPIAccessRoleBinding verifies that the jobs API access RoleBinding
 // is created with the correct RoleRef, Subjects, and owner reference.
-func TestEvalHubReconciler_createJobsProxyRoleBinding(t *testing.T) {
+func TestEvalHubReconciler_createJobsAPIAccessRoleBinding(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, rbacv1.AddToScheme(scheme))
 	require.NoError(t, evalhubv1alpha1.AddToScheme(scheme))
@@ -607,13 +582,13 @@ func TestEvalHubReconciler_createJobsProxyRoleBinding(t *testing.T) {
 		EventRecorder: record.NewFakeRecorder(10),
 	}
 
-	t.Run("should create jobs proxy RoleBinding with correct properties", func(t *testing.T) {
-		jobsSAName := evalHubName + "-jobs"
-		err := reconciler.createJobsProxyRoleBinding(ctx, evalHub, jobsSAName)
+	t.Run("should create jobs API access RoleBinding referencing per-instance Role", func(t *testing.T) {
+		jobsSAName := generateJobsServiceAccountName(evalHub)
+		err := reconciler.createJobsAPIAccessRoleBinding(ctx, evalHub, jobsSAName, testNamespace)
 		require.NoError(t, err)
 
 		// Verify RoleBinding was created
-		rbName := evalHubName + "-" + testNamespace + "-jobs-proxy-rolebinding"
+		rbName := normalizeDNS1123LabelValue(evalHubName + "-" + testNamespace + "-job-access-rb")
 		rb := &rbacv1.RoleBinding{}
 		err = fakeClient.Get(ctx, types.NamespacedName{
 			Name:      rbName,
@@ -621,9 +596,9 @@ func TestEvalHubReconciler_createJobsProxyRoleBinding(t *testing.T) {
 		}, rb)
 		require.NoError(t, err)
 
-		// Check RoleRef
-		assert.Equal(t, "ClusterRole", rb.RoleRef.Kind)
-		assert.Equal(t, "trustyai-service-operator-evalhub-jobs-proxy-role", rb.RoleRef.Name)
+		// Check RoleRef — should reference the per-instance Role (not ClusterRole)
+		assert.Equal(t, "Role", rb.RoleRef.Kind)
+		assert.Equal(t, generateJobsAPIAccessRoleName(evalHub), rb.RoleRef.Name)
 		assert.Equal(t, rbacv1.GroupName, rb.RoleRef.APIGroup)
 
 		// Check Subjects
@@ -632,15 +607,15 @@ func TestEvalHubReconciler_createJobsProxyRoleBinding(t *testing.T) {
 		assert.Equal(t, jobsSAName, rb.Subjects[0].Name)
 		assert.Equal(t, testNamespace, rb.Subjects[0].Namespace)
 
-		// Check owner reference
-		require.Len(t, rb.OwnerReferences, 1)
-		assert.Equal(t, evalHubName, rb.OwnerReferences[0].Name)
-		assert.Equal(t, "EvalHub", rb.OwnerReferences[0].Kind)
+		// No owner references — cleanup is label-based via the finalizer
+		assert.Empty(t, rb.OwnerReferences)
+		assert.Equal(t, jobResourceInstanceID(evalHub), rb.Labels["eval-hub.trustyai.opendatahub.io"])
+		assert.Equal(t, "job", rb.Labels["app.kubernetes.io/component"])
 	})
 
 	t.Run("should update subjects when they differ", func(t *testing.T) {
 		// Get existing RoleBinding
-		rbName := evalHubName + "-" + testNamespace + "-jobs-proxy-rolebinding"
+		rbName := normalizeDNS1123LabelValue(evalHubName + "-" + testNamespace + "-job-access-rb")
 		rb := &rbacv1.RoleBinding{}
 		err := fakeClient.Get(ctx, types.NamespacedName{
 			Name:      rbName,
@@ -660,8 +635,8 @@ func TestEvalHubReconciler_createJobsProxyRoleBinding(t *testing.T) {
 		require.NoError(t, err)
 
 		// Reconcile again
-		jobsSAName := evalHubName + "-jobs"
-		err = reconciler.createJobsProxyRoleBinding(ctx, evalHub, jobsSAName)
+		jobsSAName := generateJobsServiceAccountName(evalHub)
+		err = reconciler.createJobsAPIAccessRoleBinding(ctx, evalHub, jobsSAName, testNamespace)
 		require.NoError(t, err)
 
 		// Verify subjects were updated
@@ -676,9 +651,9 @@ func TestEvalHubReconciler_createJobsProxyRoleBinding(t *testing.T) {
 	})
 }
 
-// TestEvalHubReconciler_createJobsResourceManagementRoleBinding verifies that the jobs
-// resource management RoleBinding is created with the correct RoleRef, Subjects, and owner reference.
-func TestEvalHubReconciler_createJobsResourceManagementRoleBinding(t *testing.T) {
+// TestEvalHubReconciler_createAPIAccessRole verifies that the per-instance API access Role
+// is created with resourceNames scoped to the instance, with correct owner ref and idempotency.
+func TestEvalHubReconciler_createAPIAccessRole(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, rbacv1.AddToScheme(scheme))
 	require.NoError(t, evalhubv1alpha1.AddToScheme(scheme))
@@ -706,13 +681,94 @@ func TestEvalHubReconciler_createJobsResourceManagementRoleBinding(t *testing.T)
 		EventRecorder: record.NewFakeRecorder(10),
 	}
 
-	t.Run("should create jobs resource management RoleBinding with correct properties", func(t *testing.T) {
-		jobsSAName := evalHubName + "-jobs"
-		err := reconciler.createJobsResourceManagementRoleBinding(ctx, evalHub, jobsSAName)
+	t.Run("should create API access Role with resourceNames", func(t *testing.T) {
+		err := reconciler.createAPIAccessRole(ctx, evalHub)
 		require.NoError(t, err)
 
-		// Verify RoleBinding was created
-		rbName := evalHubName + "-resource-manager-jobs"
+		roleName := generateAPIAccessRoleName(evalHub)
+		role := &rbacv1.Role{}
+		err = fakeClient.Get(ctx, types.NamespacedName{
+			Name:      roleName,
+			Namespace: testNamespace,
+		}, role)
+		require.NoError(t, err)
+
+		// Check name
+		assert.Equal(t, evalHubName+"-service-access-role", role.Name)
+
+		// Check rules have resourceNames scoped to this instance
+		require.Len(t, role.Rules, 2)
+
+		// First rule: evalhubs get
+		assert.Equal(t, []string{"trustyai.opendatahub.io"}, role.Rules[0].APIGroups)
+		assert.Equal(t, []string{"evalhubs"}, role.Rules[0].Resources)
+		assert.Equal(t, []string{evalHubName}, role.Rules[0].ResourceNames)
+		assert.Equal(t, []string{"get"}, role.Rules[0].Verbs)
+
+		// Second rule: evalhubs/proxy get,create
+		assert.Equal(t, []string{"trustyai.opendatahub.io"}, role.Rules[1].APIGroups)
+		assert.Equal(t, []string{"evalhubs/proxy"}, role.Rules[1].Resources)
+		assert.Equal(t, []string{evalHubName}, role.Rules[1].ResourceNames)
+		assert.Equal(t, []string{"get", "create"}, role.Rules[1].Verbs)
+
+		// Check owner reference
+		require.Len(t, role.OwnerReferences, 1)
+		assert.Equal(t, evalHubName, role.OwnerReferences[0].Name)
+		assert.Equal(t, "EvalHub", role.OwnerReferences[0].Kind)
+		assert.True(t, *role.OwnerReferences[0].Controller)
+	})
+
+	t.Run("should be idempotent on repeated calls", func(t *testing.T) {
+		err := reconciler.createAPIAccessRole(ctx, evalHub)
+		require.NoError(t, err)
+
+		roleName := generateAPIAccessRoleName(evalHub)
+		role := &rbacv1.Role{}
+		err = fakeClient.Get(ctx, types.NamespacedName{
+			Name:      roleName,
+			Namespace: testNamespace,
+		}, role)
+		require.NoError(t, err)
+		assert.Equal(t, []string{evalHubName}, role.Rules[0].ResourceNames)
+	})
+}
+
+// TestEvalHubReconciler_createAPIAccessRoleBinding_RefersToRole verifies that the
+// API access RoleBinding references a Role (not ClusterRole).
+func TestEvalHubReconciler_createAPIAccessRoleBinding_RefersToRole(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, rbacv1.AddToScheme(scheme))
+	require.NoError(t, evalhubv1alpha1.AddToScheme(scheme))
+
+	ctx := context.Background()
+	testNamespace := "test-namespace"
+	evalHubName := "test-evalhub"
+
+	evalHub := &evalhubv1alpha1.EvalHub{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      evalHubName,
+			Namespace: testNamespace,
+			UID:       "test-uid-123",
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(evalHub).
+		Build()
+
+	reconciler := &EvalHubReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		EventRecorder: record.NewFakeRecorder(10),
+	}
+
+	t.Run("should reference Role not ClusterRole", func(t *testing.T) {
+		apiSAName := evalHubName + "-service"
+		err := reconciler.createAPIAccessRoleBinding(ctx, evalHub, apiSAName)
+		require.NoError(t, err)
+
+		rbName := evalHubName + "-service-access-rb"
 		rb := &rbacv1.RoleBinding{}
 		err = fakeClient.Get(ctx, types.NamespacedName{
 			Name:      rbName,
@@ -720,9 +776,62 @@ func TestEvalHubReconciler_createJobsResourceManagementRoleBinding(t *testing.T)
 		}, rb)
 		require.NoError(t, err)
 
-		// Check RoleRef
+		assert.Equal(t, "Role", rb.RoleRef.Kind, "RoleBinding should reference Role, not ClusterRole")
+		assert.Equal(t, generateAPIAccessRoleName(evalHub), rb.RoleRef.Name)
+	})
+}
+
+// TestEvalHubReconciler_createMLFlowAccessRoleBinding_JobsRole verifies that the jobs
+// MLflow RoleBinding uses the restricted jobs-specific ClusterRole.
+func TestEvalHubReconciler_createMLFlowAccessRoleBinding_JobsRole(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, rbacv1.AddToScheme(scheme))
+	require.NoError(t, evalhubv1alpha1.AddToScheme(scheme))
+
+	ctx := context.Background()
+	testNamespace := "test-namespace"
+	evalHubName := "test-evalhub"
+
+	evalHub := &evalhubv1alpha1.EvalHub{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      evalHubName,
+			Namespace: testNamespace,
+			UID:       "test-uid-123",
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(evalHub).
+		Build()
+
+	reconciler := &EvalHubReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		EventRecorder: record.NewFakeRecorder(10),
+	}
+
+	t.Run("should create jobs MLflow RoleBinding with restricted ClusterRole", func(t *testing.T) {
+		jobsSAName := generateJobsServiceAccountName(evalHub)
+		err := reconciler.createJobRoleBinding(ctx, evalHub, normalizeDNS1123LabelValue(evalHubName+"-"+testNamespace+"-mlflow-job-rb"), jobsSAName, testNamespace, rbacv1.RoleRef{
+			Kind:     "ClusterRole",
+			Name:     mlflowJobsAccessClusterRoleName,
+			APIGroup: rbacv1.GroupName,
+		})
+		require.NoError(t, err)
+
+		// Verify RoleBinding was created
+		rbName := normalizeDNS1123LabelValue(evalHubName + "-" + testNamespace + "-mlflow-job-rb")
+		rb := &rbacv1.RoleBinding{}
+		err = fakeClient.Get(ctx, types.NamespacedName{
+			Name:      rbName,
+			Namespace: testNamespace,
+		}, rb)
+		require.NoError(t, err)
+
+		// Check RoleRef uses the jobs-specific restricted role
 		assert.Equal(t, "ClusterRole", rb.RoleRef.Kind)
-		assert.Equal(t, "trustyai-service-operator-evalhub-resource-manager", rb.RoleRef.Name)
+		assert.Equal(t, "trustyai-service-operator-evalhub-mlflow-jobs-access", rb.RoleRef.Name)
 		assert.Equal(t, rbacv1.GroupName, rb.RoleRef.APIGroup)
 
 		// Check Subjects
@@ -731,58 +840,48 @@ func TestEvalHubReconciler_createJobsResourceManagementRoleBinding(t *testing.T)
 		assert.Equal(t, jobsSAName, rb.Subjects[0].Name)
 		assert.Equal(t, testNamespace, rb.Subjects[0].Namespace)
 
-		// Check owner reference
-		require.Len(t, rb.OwnerReferences, 1)
-		assert.Equal(t, evalHubName, rb.OwnerReferences[0].Name)
-		assert.Equal(t, "EvalHub", rb.OwnerReferences[0].Kind)
+		// No owner references — cleanup is label-based via the finalizer
+		assert.Empty(t, rb.OwnerReferences)
+		assert.Equal(t, jobResourceInstanceID(evalHub), rb.Labels["eval-hub.trustyai.opendatahub.io"])
+		assert.Equal(t, "job", rb.Labels["app.kubernetes.io/component"])
 	})
 
-	t.Run("should update subjects when they differ", func(t *testing.T) {
-		// Get existing RoleBinding
-		rbName := evalHubName + "-resource-manager-jobs"
+	t.Run("should create API MLflow RoleBinding with full ClusterRole", func(t *testing.T) {
+		apiSAName := evalHubName + "-service"
+		err := reconciler.createMLFlowAccessRoleBinding(ctx, evalHub, apiSAName, "service", mlflowAccessClusterRoleName)
+		require.NoError(t, err)
+
+		// Verify RoleBinding was created
+		rbName := evalHubName + "-mlflow-service-rb"
 		rb := &rbacv1.RoleBinding{}
-		err := fakeClient.Get(ctx, types.NamespacedName{
-			Name:      rbName,
-			Namespace: testNamespace,
-		}, rb)
-		require.NoError(t, err)
-
-		// Modify subjects
-		rb.Subjects = []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      "different-sa",
-				Namespace: testNamespace,
-			},
-		}
-		err = fakeClient.Update(ctx, rb)
-		require.NoError(t, err)
-
-		// Reconcile again
-		jobsSAName := evalHubName + "-jobs"
-		err = reconciler.createJobsResourceManagementRoleBinding(ctx, evalHub, jobsSAName)
-		require.NoError(t, err)
-
-		// Verify subjects were updated
 		err = fakeClient.Get(ctx, types.NamespacedName{
 			Name:      rbName,
 			Namespace: testNamespace,
 		}, rb)
 		require.NoError(t, err)
 
+		// Check RoleRef uses the full access role
+		assert.Equal(t, "ClusterRole", rb.RoleRef.Kind)
+		assert.Equal(t, "trustyai-service-operator-evalhub-mlflow-access", rb.RoleRef.Name)
+		assert.Equal(t, rbacv1.GroupName, rb.RoleRef.APIGroup)
+
+		// Check Subjects
 		require.Len(t, rb.Subjects, 1)
-		assert.Equal(t, jobsSAName, rb.Subjects[0].Name)
+		assert.Equal(t, "ServiceAccount", rb.Subjects[0].Kind)
+		assert.Equal(t, apiSAName, rb.Subjects[0].Name)
 	})
 
 	t.Run("should be idempotent on repeated calls", func(t *testing.T) {
-		jobsSAName := evalHubName + "-jobs"
-
-		// Call again
-		err := reconciler.createJobsResourceManagementRoleBinding(ctx, evalHub, jobsSAName)
+		jobsSAName := generateJobsServiceAccountName(evalHub)
+		err := reconciler.createJobRoleBinding(ctx, evalHub, normalizeDNS1123LabelValue(evalHubName+"-"+testNamespace+"-mlflow-job-rb"), jobsSAName, testNamespace, rbacv1.RoleRef{
+			Kind:     "ClusterRole",
+			Name:     mlflowJobsAccessClusterRoleName,
+			APIGroup: rbacv1.GroupName,
+		})
 		require.NoError(t, err)
 
 		// Verify RoleBinding still exists with correct properties
-		rbName := evalHubName + "-resource-manager-jobs"
+		rbName := normalizeDNS1123LabelValue(evalHubName + "-" + testNamespace + "-mlflow-job-rb")
 		rb := &rbacv1.RoleBinding{}
 		err = fakeClient.Get(ctx, types.NamespacedName{
 			Name:      rbName,
@@ -790,14 +889,14 @@ func TestEvalHubReconciler_createJobsResourceManagementRoleBinding(t *testing.T)
 		}, rb)
 		require.NoError(t, err)
 
-		assert.Equal(t, "trustyai-service-operator-evalhub-resource-manager", rb.RoleRef.Name)
+		assert.Equal(t, "trustyai-service-operator-evalhub-mlflow-jobs-access", rb.RoleRef.Name)
 		require.Len(t, rb.Subjects, 1)
 		assert.Equal(t, jobsSAName, rb.Subjects[0].Name)
 	})
 }
 
 // TestEvalHubReconciler_cleanupClusterRoleBinding verifies that cleanup removes
-// the proxy ClusterRoleBinding, jobs RoleBinding, and legacy ClusterRoleBinding.
+// the auth-reviewer ClusterRoleBinding (the only cluster-scoped resource not owner-ref'd).
 func TestEvalHubReconciler_cleanupClusterRoleBinding(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, rbacv1.AddToScheme(scheme))
@@ -814,60 +913,20 @@ func TestEvalHubReconciler_cleanupClusterRoleBinding(t *testing.T) {
 		},
 	}
 
-	// Create test resources
-	proxyCRBName := evalHubName + "-" + testNamespace + "-proxy-rolebinding"
-	proxyCRB := &rbacv1.ClusterRoleBinding{
+	authCRBName := evalHubName + "-" + testNamespace + "-auth-reviewer-crb"
+	authCRB := &rbacv1.ClusterRoleBinding{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: proxyCRBName,
+			Name: authCRBName,
 		},
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: rbacv1.GroupName,
 			Kind:     "ClusterRole",
-			Name:     "trustyai-service-operator-evalhub-proxy-role",
+			Name:     authReviewerClusterRoleName,
 		},
 		Subjects: []rbacv1.Subject{
 			{
 				Kind:      "ServiceAccount",
-				Name:      evalHubName + "-proxy",
-				Namespace: testNamespace,
-			},
-		},
-	}
-
-	jobsRBName := evalHubName + "-" + testNamespace + "-jobs-proxy-rolebinding"
-	jobsRB := &rbacv1.RoleBinding{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      jobsRBName,
-			Namespace: testNamespace,
-		},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: rbacv1.GroupName,
-			Kind:     "ClusterRole",
-			Name:     "trustyai-service-operator-evalhub-jobs-proxy-role",
-		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      evalHubName + "-jobs",
-				Namespace: testNamespace,
-			},
-		},
-	}
-
-	legacyJobsCRBName := testNamespace + "-" + evalHubName + "-jobs-proxy"
-	legacyJobsCRB := &rbacv1.ClusterRoleBinding{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: legacyJobsCRBName,
-		},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: rbacv1.GroupName,
-			Kind:     "ClusterRole",
-			Name:     "trustyai-service-operator-evalhub-jobs-proxy-role",
-		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      evalHubName + "-jobs",
+				Name:      evalHubName + "-service",
 				Namespace: testNamespace,
 			},
 		},
@@ -875,7 +934,7 @@ func TestEvalHubReconciler_cleanupClusterRoleBinding(t *testing.T) {
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(evalHub, proxyCRB, jobsRB, legacyJobsCRB).
+		WithObjects(evalHub, authCRB).
 		Build()
 
 	reconciler := &EvalHubReconciler{
@@ -884,32 +943,15 @@ func TestEvalHubReconciler_cleanupClusterRoleBinding(t *testing.T) {
 		EventRecorder: record.NewFakeRecorder(10),
 	}
 
-	t.Run("should delete proxy ClusterRoleBinding", func(t *testing.T) {
+	t.Run("should delete auth reviewer ClusterRoleBinding", func(t *testing.T) {
 		err := reconciler.cleanupClusterRoleBinding(ctx, evalHub)
 		require.NoError(t, err)
 
-		// Verify proxy CRB was deleted
-		err = fakeClient.Get(ctx, types.NamespacedName{Name: proxyCRBName}, &rbacv1.ClusterRoleBinding{})
-		assert.True(t, errors.IsNotFound(err), "Proxy ClusterRoleBinding should be deleted")
-	})
-
-	t.Run("should delete jobs RoleBinding", func(t *testing.T) {
-		// Verify jobs RB was deleted
-		err := fakeClient.Get(ctx, types.NamespacedName{
-			Name:      jobsRBName,
-			Namespace: testNamespace,
-		}, &rbacv1.RoleBinding{})
-		assert.True(t, errors.IsNotFound(err), "Jobs RoleBinding should be deleted")
-	})
-
-	t.Run("should delete legacy jobs ClusterRoleBinding", func(t *testing.T) {
-		// Verify legacy CRB was deleted
-		err := fakeClient.Get(ctx, types.NamespacedName{Name: legacyJobsCRBName}, &rbacv1.ClusterRoleBinding{})
-		assert.True(t, errors.IsNotFound(err), "Legacy jobs ClusterRoleBinding should be deleted")
+		err = fakeClient.Get(ctx, types.NamespacedName{Name: authCRBName}, &rbacv1.ClusterRoleBinding{})
+		assert.True(t, errors.IsNotFound(err), "Auth reviewer ClusterRoleBinding should be deleted")
 	})
 
 	t.Run("should be idempotent when resources don't exist", func(t *testing.T) {
-		// Call cleanup again - should not error
 		err := reconciler.cleanupClusterRoleBinding(ctx, evalHub)
 		require.NoError(t, err)
 	})
@@ -1066,6 +1108,7 @@ func TestEvalHubReconciler_reconcileServiceCAConfigMap(t *testing.T) {
 
 func TestGenerateConfigData_WithDatabase(t *testing.T) {
 	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, evalhubv1alpha1.AddToScheme(scheme))
 
 	t.Run("should include database and secrets sections when DB configured", func(t *testing.T) {
@@ -1081,8 +1124,17 @@ func TestGenerateConfigData_WithDatabase(t *testing.T) {
 			},
 		}
 
-		reconciler := &EvalHubReconciler{Scheme: scheme}
-		configData, err := reconciler.generateConfigData(evalHub)
+		configMap := createConfigMap(configMapName, evalHub.Namespace)
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub, configMap).
+			Build()
+		reconciler := &EvalHubReconciler{
+			Client:    fakeClient,
+			Scheme:    scheme,
+			Namespace: evalHub.Namespace,
+		}
+		configData, err := reconciler.generateConfigData(context.Background(), evalHub)
 		require.NoError(t, err)
 
 		var config EvalHubConfig
@@ -1116,8 +1168,17 @@ func TestGenerateConfigData_WithDatabase(t *testing.T) {
 			},
 		}
 
-		reconciler := &EvalHubReconciler{Scheme: scheme}
-		configData, err := reconciler.generateConfigData(evalHub)
+		configMap := createConfigMap(configMapName, evalHub.Namespace)
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub, configMap).
+			Build()
+		reconciler := &EvalHubReconciler{
+			Client:    fakeClient,
+			Scheme:    scheme,
+			Namespace: evalHub.Namespace,
+		}
+		configData, err := reconciler.generateConfigData(context.Background(), evalHub)
 		require.NoError(t, err)
 
 		var config EvalHubConfig
@@ -1129,7 +1190,7 @@ func TestGenerateConfigData_WithDatabase(t *testing.T) {
 		assert.Equal(t, 10, config.Database.MaxIdleConns)
 	})
 
-	t.Run("should omit database and secrets sections when DB not configured", func(t *testing.T) {
+	t.Run("should default to sqlite when DB not explicitly configured", func(t *testing.T) {
 		evalHub := &evalhubv1alpha1.EvalHub{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-evalhub",
@@ -1137,16 +1198,155 @@ func TestGenerateConfigData_WithDatabase(t *testing.T) {
 			},
 		}
 
-		reconciler := &EvalHubReconciler{Scheme: scheme}
-		configData, err := reconciler.generateConfigData(evalHub)
+		configMap := createConfigMap(configMapName, evalHub.Namespace)
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub, configMap).
+			Build()
+		reconciler := &EvalHubReconciler{
+			Client:    fakeClient,
+			Scheme:    scheme,
+			Namespace: evalHub.Namespace,
+		}
+		configData, err := reconciler.generateConfigData(context.Background(), evalHub)
 		require.NoError(t, err)
 
 		var config EvalHubConfig
 		err = yaml.Unmarshal([]byte(configData["config.yaml"]), &config)
 		require.NoError(t, err)
 
-		assert.Nil(t, config.Database)
+		assert.NotNil(t, config.Database)
+		assert.Equal(t, "sqlite", config.Database.Driver)
 		assert.Nil(t, config.Secrets)
+	})
+}
+
+func TestGenerateConfigData_WithOTEL(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, evalhubv1alpha1.AddToScheme(scheme))
+
+	t.Run("should include otel section when configured", func(t *testing.T) {
+		evalHub := &evalhubv1alpha1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-evalhub",
+				Namespace: "test-namespace",
+			},
+			Spec: evalhubv1alpha1.EvalHubSpec{
+				Otel: &evalhubv1alpha1.OTELSpec{
+					ExporterType:     "otlp-grpc",
+					ExporterEndpoint: "otel-collector:4317",
+					ExporterInsecure: true,
+					SamplingRatio:    "0.5",
+					EnableTracing:    true,
+					EnableMetrics:    true,
+					EnableLogs:       false,
+				},
+			},
+		}
+
+		configMap := createConfigMap(configMapName, evalHub.Namespace)
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub, configMap).
+			Build()
+		reconciler := &EvalHubReconciler{
+			Client:    fakeClient,
+			Scheme:    scheme,
+			Namespace: evalHub.Namespace,
+		}
+		configData, err := reconciler.generateConfigData(context.Background(), evalHub)
+		require.NoError(t, err)
+
+		var config EvalHubConfig
+		err = yaml.Unmarshal([]byte(configData["config.yaml"]), &config)
+		require.NoError(t, err)
+
+		require.NotNil(t, config.OTEL)
+		assert.True(t, config.OTEL.Enabled)
+		assert.Equal(t, "otlp-grpc", config.OTEL.ExporterType)
+		assert.Equal(t, "otel-collector:4317", config.OTEL.ExporterEndpoint)
+		assert.True(t, config.OTEL.ExporterInsecure)
+		require.NotNil(t, config.OTEL.SamplingRatio)
+		assert.Equal(t, 0.5, *config.OTEL.SamplingRatio)
+		assert.True(t, config.OTEL.EnableTracing)
+		assert.True(t, config.OTEL.EnableMetrics)
+		assert.False(t, config.OTEL.EnableLogs)
+	})
+
+	t.Run("should use custom values", func(t *testing.T) {
+		evalHub := &evalhubv1alpha1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-evalhub",
+				Namespace: "test-namespace",
+			},
+			Spec: evalhubv1alpha1.EvalHubSpec{
+				Otel: &evalhubv1alpha1.OTELSpec{
+					ExporterType:     "otlp-http",
+					ExporterEndpoint: "https://tempo.example.com:4318",
+					ExporterInsecure: false,
+					SamplingRatio:    "0.1",
+					EnableTracing:    true,
+					EnableMetrics:    false,
+					EnableLogs:       true,
+				},
+			},
+		}
+
+		configMap := createConfigMap(configMapName, evalHub.Namespace)
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub, configMap).
+			Build()
+		reconciler := &EvalHubReconciler{
+			Client:    fakeClient,
+			Scheme:    scheme,
+			Namespace: evalHub.Namespace,
+		}
+		configData, err := reconciler.generateConfigData(context.Background(), evalHub)
+		require.NoError(t, err)
+
+		var config EvalHubConfig
+		err = yaml.Unmarshal([]byte(configData["config.yaml"]), &config)
+		require.NoError(t, err)
+
+		require.NotNil(t, config.OTEL)
+		assert.Equal(t, "otlp-http", config.OTEL.ExporterType)
+		assert.Equal(t, "https://tempo.example.com:4318", config.OTEL.ExporterEndpoint)
+		assert.False(t, config.OTEL.ExporterInsecure)
+		require.NotNil(t, config.OTEL.SamplingRatio)
+		assert.Equal(t, 0.1, *config.OTEL.SamplingRatio)
+		assert.True(t, config.OTEL.EnableTracing)
+		assert.False(t, config.OTEL.EnableMetrics)
+		assert.True(t, config.OTEL.EnableLogs)
+	})
+
+	t.Run("should omit otel section when not configured", func(t *testing.T) {
+		evalHub := &evalhubv1alpha1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-evalhub",
+				Namespace: "test-namespace",
+			},
+		}
+
+		configMap := createConfigMap(configMapName, evalHub.Namespace)
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub, configMap).
+			Build()
+		reconciler := &EvalHubReconciler{
+			Client:    fakeClient,
+			Scheme:    scheme,
+			Namespace: evalHub.Namespace,
+		}
+		configData, err := reconciler.generateConfigData(context.Background(), evalHub)
+		require.NoError(t, err)
+
+		var config EvalHubConfig
+		err = yaml.Unmarshal([]byte(configData["config.yaml"]), &config)
+		require.NoError(t, err)
+
+		assert.Nil(t, config.OTEL)
 	})
 }
 
@@ -1179,8 +1379,7 @@ func TestEvalHubReconciler_reconcileDeployment_WithDB(t *testing.T) {
 			Namespace: testNamespace,
 		},
 		Data: map[string]string{
-			configMapEvalHubImageKey:       "quay.io/test/eval-hub:latest",
-			configMapKubeRBACProxyImageKey: "gcr.io/kubebuilder/kube-rbac-proxy:v0.13.1",
+			configMapEvalHubImageKey: "quay.io/test/eval-hub:latest",
 		},
 	}
 
@@ -1197,7 +1396,7 @@ func TestEvalHubReconciler_reconcileDeployment_WithDB(t *testing.T) {
 	}
 
 	t.Run("should add DB secret volume and mount when database configured", func(t *testing.T) {
-		err := reconciler.reconcileDeployment(ctx, evalHub)
+		err := reconciler.reconcileDeployment(ctx, evalHub, nil)
 		require.NoError(t, err)
 
 		deployment := &appsv1.Deployment{}
@@ -1207,8 +1406,8 @@ func TestEvalHubReconciler_reconcileDeployment_WithDB(t *testing.T) {
 		}, deployment)
 		require.NoError(t, err)
 
-		// Should have 4 volumes: evalhub-config, kube-rbac-proxy-config, tls, db-secret
-		assert.Len(t, deployment.Spec.Template.Spec.Volumes, 4)
+		// Should have 5 volumes: evalhub-config, tls, service-ca, mlflow-token, db-secret
+		assert.Len(t, deployment.Spec.Template.Spec.Volumes, 5)
 
 		// Find the DB secret volume
 		var dbVolume *corev1.Volume
@@ -1234,7 +1433,7 @@ func TestEvalHubReconciler_reconcileDeployment_WithDB(t *testing.T) {
 			}
 		}
 		require.NotNil(t, container)
-		assert.Len(t, container.VolumeMounts, 2) // evalhub-config + db-secret
+		assert.Len(t, container.VolumeMounts, 5) // evalhub-config + tls + service-ca + mlflow-token + db-secret
 
 		var dbMount *corev1.VolumeMount
 		for i, m := range container.VolumeMounts {
@@ -1269,5 +1468,213 @@ func TestEvalHubHelperMethods_IsDatabaseConfigured(t *testing.T) {
 			},
 		}
 		assert.True(t, spec.IsDatabaseConfigured())
+	})
+}
+
+func TestEvalHubReconciler_reconcileProviderConfigMaps(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, appsv1.AddToScheme(scheme))
+	require.NoError(t, evalhubv1alpha1.AddToScheme(scheme))
+
+	ctx := context.Background()
+	operatorNamespace := "operator-ns"
+	instanceNamespace := "instance-ns"
+	evalHubName := "test-evalhub"
+
+	// Source provider ConfigMap in the operator namespace (simulates what kustomize deploys)
+	sourceProvider := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "trustyai-service-operator-evalhub-provider-testprovider",
+			Namespace: operatorNamespace,
+			Labels: map[string]string{
+				providerLabel:     "system",
+				providerNameLabel: "testprovider",
+			},
+		},
+		Data: map[string]string{
+			"testprovider.yaml": "id: testprovider\nname: Test Provider\nruntime:\n  k8s:\n    image: quay.io/test/provider:latest\n",
+		},
+	}
+
+	t.Run("should copy provider ConfigMap to instance namespace", func(t *testing.T) {
+		evalHub := &evalhubv1alpha1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      evalHubName,
+				Namespace: instanceNamespace,
+			},
+			Spec: evalhubv1alpha1.EvalHubSpec{
+				Providers: []string{"testprovider"},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub, sourceProvider).
+			Build()
+
+		reconciler := &EvalHubReconciler{
+			Client:        fakeClient,
+			Scheme:        scheme,
+			Namespace:     operatorNamespace,
+			EventRecorder: record.NewFakeRecorder(10),
+		}
+
+		cmNames, err := reconciler.reconcileProviderConfigMaps(ctx, evalHub)
+		require.NoError(t, err)
+
+		// Should return the target ConfigMap name
+		require.Len(t, cmNames, 1)
+		assert.Equal(t, evalHubName+"-provider-testprovider", cmNames[0])
+
+		// Verify the ConfigMap was created in the instance namespace with correct data
+		copiedCM := &corev1.ConfigMap{}
+		err = fakeClient.Get(ctx, types.NamespacedName{
+			Name:      evalHubName + "-provider-testprovider",
+			Namespace: instanceNamespace,
+		}, copiedCM)
+		require.NoError(t, err)
+		assert.Equal(t, sourceProvider.Data["testprovider.yaml"], copiedCM.Data["testprovider.yaml"])
+	})
+
+	t.Run("should return nil when no providers specified", func(t *testing.T) {
+		evalHub := &evalhubv1alpha1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      evalHubName,
+				Namespace: instanceNamespace,
+			},
+			Spec: evalhubv1alpha1.EvalHubSpec{},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub).
+			Build()
+
+		reconciler := &EvalHubReconciler{
+			Client:        fakeClient,
+			Scheme:        scheme,
+			Namespace:     operatorNamespace,
+			EventRecorder: record.NewFakeRecorder(10),
+		}
+
+		cmNames, err := reconciler.reconcileProviderConfigMaps(ctx, evalHub)
+		require.NoError(t, err)
+		assert.Nil(t, cmNames)
+	})
+
+	t.Run("should error when provider not found", func(t *testing.T) {
+		evalHub := &evalhubv1alpha1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      evalHubName,
+				Namespace: instanceNamespace,
+			},
+			Spec: evalhubv1alpha1.EvalHubSpec{
+				Providers: []string{"nonexistent"},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub).
+			Build()
+
+		reconciler := &EvalHubReconciler{
+			Client:        fakeClient,
+			Scheme:        scheme,
+			Namespace:     operatorNamespace,
+			EventRecorder: record.NewFakeRecorder(10),
+		}
+
+		cmNames, err := reconciler.reconcileProviderConfigMaps(ctx, evalHub)
+		require.Error(t, err)
+		assert.Nil(t, cmNames)
+		assert.Contains(t, err.Error(), "not found")
+	})
+
+	t.Run("should mount providers as projected volume in deployment", func(t *testing.T) {
+		evalHub := &evalhubv1alpha1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      evalHubName,
+				Namespace: instanceNamespace,
+			},
+			Spec: evalhubv1alpha1.EvalHubSpec{
+				Providers: []string{"testprovider"},
+			},
+		}
+
+		operatorConfigMap := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      configMapName,
+				Namespace: operatorNamespace,
+			},
+			Data: map[string]string{
+				configMapEvalHubImageKey: "quay.io/test/eval-hub:latest",
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub, sourceProvider, operatorConfigMap).
+			Build()
+
+		reconciler := &EvalHubReconciler{
+			Client:        fakeClient,
+			Scheme:        scheme,
+			Namespace:     operatorNamespace,
+			EventRecorder: record.NewFakeRecorder(10),
+		}
+
+		// First reconcile provider ConfigMaps
+		cmNames, err := reconciler.reconcileProviderConfigMaps(ctx, evalHub)
+		require.NoError(t, err)
+		require.Len(t, cmNames, 1)
+
+		// Then reconcile deployment with the provider ConfigMap names
+		err = reconciler.reconcileDeployment(ctx, evalHub, cmNames)
+		require.NoError(t, err)
+
+		// Verify the deployment has the projected volume
+		deployment := &appsv1.Deployment{}
+		err = fakeClient.Get(ctx, types.NamespacedName{
+			Name:      evalHubName,
+			Namespace: instanceNamespace,
+		}, deployment)
+		require.NoError(t, err)
+
+		// Find the evalhub-providers projected volume
+		var providersVolume *corev1.Volume
+		for i, v := range deployment.Spec.Template.Spec.Volumes {
+			if v.Name == providersVolumeName {
+				providersVolume = &deployment.Spec.Template.Spec.Volumes[i]
+				break
+			}
+		}
+		require.NotNil(t, providersVolume, "evalhub-providers volume should be present")
+		require.NotNil(t, providersVolume.VolumeSource.Projected)
+		require.Len(t, providersVolume.VolumeSource.Projected.Sources, 1)
+		assert.Equal(t, evalHubName+"-provider-testprovider",
+			providersVolume.VolumeSource.Projected.Sources[0].ConfigMap.Name)
+
+		// Find the providers volume mount on the evalhub container
+		var evalHubContainer *corev1.Container
+		for i, c := range deployment.Spec.Template.Spec.Containers {
+			if c.Name == containerName {
+				evalHubContainer = &deployment.Spec.Template.Spec.Containers[i]
+				break
+			}
+		}
+		require.NotNil(t, evalHubContainer)
+
+		var providersMount *corev1.VolumeMount
+		for i, m := range evalHubContainer.VolumeMounts {
+			if m.Name == providersVolumeName {
+				providersMount = &evalHubContainer.VolumeMounts[i]
+				break
+			}
+		}
+		require.NotNil(t, providersMount, "providers volume mount should be present")
+		assert.Equal(t, providersMountPath, providersMount.MountPath)
+		assert.True(t, providersMount.ReadOnly)
 	})
 }

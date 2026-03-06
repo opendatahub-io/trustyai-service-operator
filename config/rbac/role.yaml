@@ -161,6 +161,7 @@ rules:
   - rbac.authorization.k8s.io
   resources:
   - rolebindings
+  - roles
   verbs:
   - create
   - delete
@@ -251,7 +252,6 @@ rules:
   verbs:
   - create
   - get
-  - update
 - apiGroups:
   - trustyai.opendatahub.io
   resources:
@@ -264,3 +264,9 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - trustyai.opendatahub.io
+  resources:
+  - status-events
+  verbs:
+  - create
