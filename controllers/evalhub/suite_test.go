@@ -94,7 +94,8 @@ func createEvalHubInstance(name, namespace string) *evalhubv1alpha1.EvalHub {
 			Namespace: namespace,
 		},
 		Spec: evalhubv1alpha1.EvalHubSpec{
-			Replicas: &replicas,
+			Replicas:  &replicas,
+			Providers: []string{},
 			Env: []corev1.EnvVar{
 				{
 					Name:  "TEST_ENV",
@@ -122,10 +123,33 @@ func createConfigMap(name, namespace string) *corev1.ConfigMap {
 			Namespace: namespace,
 		},
 		Data: map[string]string{
-			"evalHubImage":    "quay.io/ruimvieira/eval-hub:test",
-			"kube-rbac-proxy": "gcr.io/kubebuilder/kube-rbac-proxy:v0.13.1",
+			"evalHubImage": "quay.io/ruimvieira/eval-hub:test",
 		},
 	}
+}
+
+// createDefaultProviderConfigMaps creates source provider ConfigMaps in the given namespace
+// to satisfy the CRD default providers list during integration tests.
+func createDefaultProviderConfigMaps(namespace string) []*corev1.ConfigMap {
+	defaultProviders := []string{"garak", "guidellm", "lighteval", "lm-evaluation-harness"}
+	var cms []*corev1.ConfigMap
+	for _, id := range defaultProviders {
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "evalhub-provider-" + id,
+				Namespace: namespace,
+				Labels: map[string]string{
+					providerLabel:     "system",
+					providerNameLabel: id,
+				},
+			},
+			Data: map[string]string{
+				id + ".yaml": "id: " + id + "\nname: " + id + "\n",
+			},
+		}
+		cms = append(cms, cm)
+	}
+	return cms
 }
 
 // setupReconciler creates and returns a EvalHubReconciler for testing
@@ -137,6 +161,24 @@ func setupReconciler(namespace string) (*EvalHubReconciler, context.Context) {
 		Scheme:        scheme.Scheme,
 		Namespace:     namespace,
 		EventRecorder: eventRecorder,
+	}
+
+	// Create the operator image ConfigMap so getEvalHubImage succeeds.
+	operatorCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      configMapName,
+			Namespace: namespace,
+		},
+		Data: map[string]string{
+			configMapEvalHubImageKey: "quay.io/evalhub/evalhub:test",
+		},
+	}
+	if err := k8sClient.Create(ctx, operatorCM); err != nil {
+		// AlreadyExists: another BeforeEach already created it for this namespace.
+		// NotFound: namespace doesn't exist — intentionally-bad reconciler test cases.
+		if !errors.IsAlreadyExists(err) && !errors.IsNotFound(err) {
+			Expect(err).NotTo(HaveOccurred())
+		}
 	}
 
 	return reconciler, ctx
