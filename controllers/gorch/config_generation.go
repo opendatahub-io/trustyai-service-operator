@@ -8,6 +8,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/kserve/kserve/pkg/apis/serving/v1alpha1"
 	kservev1beta1 "github.com/kserve/kserve/pkg/apis/serving/v1beta1"
+	"github.com/trustyai-explainability/trustyai-service-operator/api/common"
 	gorchv1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/gorch/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -185,7 +186,7 @@ func (r *GuardrailsOrchestratorReconciler) extractInferenceServiceInfo(ctx conte
 	if url.Scheme == "https" {
 		matchingSecret, err := r.findPredictorServingCertSecret(ctx, namespace, isvc.Name)
 		if err != nil {
-			return nil, fmt.Errorf("could not find serving secret for InferenceService %q in namespace %s", isvc.Name, namespace)
+			return nil, err
 		}
 		return &gorchv1alpha1.DetectedService{Name: isvc.Name, Hostname: url.Hostname(), Port: port, Scheme: url.Scheme, Type: generationType, TLSSecret: matchingSecret.Name}, nil
 	} else {
@@ -377,7 +378,7 @@ func (r *GuardrailsOrchestratorReconciler) applyOrchestratorConfigMap(ctx contex
 // updateStatusWithOrchestratorConfigInfo populates the orchestrator's status with information about the auto-generated
 // orchestrator config
 func (r *GuardrailsOrchestratorReconciler) updateStatusWithOrchestratorConfigInfo(ctx context.Context, orchestrator *gorchv1alpha1.GuardrailsOrchestrator, configMap corev1.ConfigMap, generationService gorchv1alpha1.DetectedService, detectorServices []gorchv1alpha1.DetectedService) error {
-	orchestrator.Status.Conditions = []gorchv1alpha1.Condition{
+	orchestrator.Status.Conditions = []common.Condition{
 		{
 			Type:    "Available",
 			Status:  "True",

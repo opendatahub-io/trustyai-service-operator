@@ -17,8 +17,8 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"github.com/trustyai-explainability/trustyai-service-operator/api/common"
 	corev1 "k8s.io/api/core/v1"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -43,7 +43,7 @@ type GuardrailsOrchestratorSpec struct {
 	// Important: Run "make" to regenerate code after modifying this file
 	// Number of replicas
 	Replicas int32 `json:"replicas"`
-	// Name of configmap containing generator,detector,and chunker arguments
+	// Name of configmap containing generator, detector, and chunker arguments
 	// +optional
 	OrchestratorConfig *string `json:"orchestratorConfig,omitempty"`
 	// Settings governing the automatic configuration of the orchestrator. Replaces `OrchestratorConfig`.
@@ -64,6 +64,14 @@ type GuardrailsOrchestratorSpec struct {
 	// Set log level in the orchestrator deployment
 	// +optional
 	LogLevel *string `json:"logLevel,omitempty"`
+<<<<<<< HEAD
+=======
+	// Define TLS secrets to be mounted to the orchestrator. Secrets will be mounted at /etc/tls/$SECRET_NAME
+	// +optional
+	TLSSecrets *[]string `json:"tlsSecrets,omitempty"`
+	// Define environment variables. These will be added to the orchestrator, gateway, and built-in detector pods.
+	EnvVars *[]corev1.EnvVar `json:"env,omitempty"`
+>>>>>>> 6c52ee8 (Add env variable specification to GuardrailsOrch API (#602))
 }
 
 // OtelExporter defines the environment variables for configuring the OTLP exporter.
@@ -91,23 +99,6 @@ type OtelExporter struct {
 	OTLPExport string `json:"otlpExport,omitempty"`
 }
 
-type ConditionType string
-
-type Condition struct {
-	Type ConditionType `json:"type" description:"type of condition ie. Available|Progressing|Degraded."`
-
-	Status corev1.ConditionStatus `json:"status" description:"status of the condition, one of True, False, Unknown"`
-
-	// +optional
-	Reason string `json:"reason,omitempty" description:"one-word CamelCase reason for the condition's last transition"`
-
-	// +optional
-	Message string `json:"message,omitempty" description:"human-readable message indicating details about last transition"`
-
-	// +optional
-	LastTransitionTime metav1.Time `json:"lastTransitionTime" description:"last time the condition transit from one status to another"`
-}
-
 type DetectedService struct {
 	Name      string `json:"name,omitempty"`
 	Type      string `json:"type,omitempty"`   // e.g. "generator" or "detector"
@@ -132,7 +123,7 @@ type GuardrailsOrchestratorStatus struct {
 	Phase string `json:"phase,omitempty"`
 	// Conditions describes the state of the GuardrailsOrchestrator resource.
 	// +optional
-	Conditions []Condition `json:"conditions,omitempty"`
+	Conditions []common.Condition `json:"conditions,omitempty"`
 	// AutoConfigState describes information about the generated autoconfiguration
 	// +optional
 	AutoConfigState *AutoConfigState `json:"autoConfigState,omitempty"`

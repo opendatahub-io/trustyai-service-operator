@@ -2,6 +2,7 @@ package tas
 
 import (
 	"context"
+	"github.com/trustyai-explainability/trustyai-service-operator/controllers/utils"
 
 	trustyaiopendatahubiov1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/tas/v1alpha1"
 	"github.com/trustyai-explainability/trustyai-service-operator/controllers/constants"
@@ -123,6 +124,7 @@ func (r *TrustyAIServiceReconciler) createClusterRoleBinding(ctx context.Context
 		return err
 	}
 
+<<<<<<< HEAD
 	// Check if this ClusterRoleBinding already exists
 	found := &rbacv1.ClusterRoleBinding{}
 	err := r.Get(ctx, types.NamespacedName{Name: clusterRoleBinding.Name}, found)
@@ -133,6 +135,10 @@ func (r *TrustyAIServiceReconciler) createClusterRoleBinding(ctx context.Context
 			log.FromContext(ctx).Error(err, "Error creating a new ClusterRoleBinding")
 			return err
 		}
+=======
+	if err := utils.ReconcileClusterRoleBinding(ctx, r.Client, clusterRoleBinding); err != nil {
+		return err
+>>>>>>> f7cb3c7 (Second round of function standardization (#607))
 	}
 
 	return nil

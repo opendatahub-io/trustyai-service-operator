@@ -2,22 +2,18 @@ package tas
 
 import (
 	"context"
-	"reflect"
+	"github.com/trustyai-explainability/trustyai-service-operator/controllers/utils"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	routev1 "github.com/openshift/api/route/v1"
 	trustyaiopendatahubiov1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/tas/v1alpha1"
 	templateParser "github.com/trustyai-explainability/trustyai-service-operator/controllers/tas/templates"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 const (
 	routeTemplatePath = "service/route.tmpl.yaml"
 )
 
+<<<<<<< HEAD
 type RouteConfig struct {
 	Name      string
 	Namespace string
@@ -89,33 +85,16 @@ func (r *TrustyAIServiceReconciler) reconcileRouteAuth(instance *trustyaiopendat
 	return nil
 }
 
+=======
+>>>>>>> b3ba151 (Cleanup: Generalize configmap and route creation, reconciliation functions (#601))
 // ReconcileRoute will manage the creation, update and deletion of the
 // TLS route when the service is reconciled
 func (r *TrustyAIServiceReconciler) ReconcileRoute(
-	instance *trustyaiopendatahubiov1alpha1.TrustyAIService, ctx context.Context) error {
-	return r.reconcileRouteAuth(instance, ctx, r.createRouteObject)
-}
-
-func (r *TrustyAIServiceReconciler) checkRouteReady(ctx context.Context, cr *trustyaiopendatahubiov1alpha1.TrustyAIService) (bool, error) {
-	existingRoute := &routev1.Route{}
-
-	err := r.Client.Get(ctx, types.NamespacedName{Name: cr.Name, Namespace: cr.Namespace}, existingRoute)
-	if err != nil {
-		log.FromContext(ctx).Info("Unable to find the Route")
-		if errors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, err
+	instance *trustyaiopendatahubiov1alpha1.TrustyAIService, ctx context.Context, c client.Client) error {
+	routeConfig := utils.RouteConfig{
+		ServiceName: instance.Name + "-tls",
+		PortName:    KubeRBACProxyServicePortName,
 	}
-
-	for _, ingress := range existingRoute.Status.Ingress {
-		for _, condition := range ingress.Conditions {
-			if condition.Type == routev1.RouteAdmitted && condition.Status == corev1.ConditionTrue {
-				// The Route is admitted, so it's ready
-				return true, nil
-			}
-		}
-	}
-
-	return false, nil
+	err := utils.ReconcileRoute(ctx, c, instance, routeConfig, routeTemplatePath, templateParser.ParseResource)
+	return err
 }
