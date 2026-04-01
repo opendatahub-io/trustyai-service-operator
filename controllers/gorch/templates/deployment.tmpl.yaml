@@ -1,5 +1,46 @@
+<<<<<<< HEAD
 {{ define "oAuthProxy" }} name: oauth-proxy-{{ .Suffix }}
           image: {{ .OAuthProxyImage}}
+=======
+{{ define "kubeRBACProxy" }} name: kube-rbac-proxy-{{ .Suffix }}
+          image: {{ .KubeRBACProxyImage}}
+          args:
+            - --secure-listen-address=0.0.0.0:{{ .DownstreamPort }}
+            - --upstream={{ .UpstreamProtocol }}://{{ .UpstreamHost }}:{{ .UpstreamPort }}/
+            - --config-file=/etc/kube-rbac-proxy/config.yaml
+            - --tls-cert-file=/etc/tls/private/tls.crt
+            - --tls-private-key-file=/etc/tls/private/tls.key
+            - --upstream-ca-file=/etc/tls/ca/service-ca.crt
+            - --proxy-endpoints-port={{ .HealthPort }}
+            - --v=0
+          ports:
+            - containerPort: {{ .DownstreamPort }}
+              name: https
+              protocol: TCP
+            - containerPort: {{ .HealthPort }}
+              name: proxy-healthz
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .HealthPort }}
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 1
+            successThreshold: 1
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .HealthPort }}
+              scheme: HTTPS
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 1
+            successThreshold: 1
+            failureThreshold: 3
+>>>>>>> a77a2e2 (Mount and reference service ca to kube-rbac-proxy (#594))
           resources:
             limits:
               cpu: 100m
@@ -43,6 +84,12 @@
               readOnly: true
             - name: tls-ca-bundle
               mountPath: /etc/tls/ca
+<<<<<<< HEAD
+=======
+              readOnly: true
+            - name: kube-rbac-proxy-{{ .Suffix }}-config
+              mountPath: /etc/kube-rbac-proxy
+>>>>>>> a77a2e2 (Mount and reference service ca to kube-rbac-proxy (#594))
               readOnly: true
           args:
             - '--cookie-secret=SECRET'
