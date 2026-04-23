@@ -1,0 +1,112 @@
+package evalhub
+
+import (
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+)
+
+const (
+	// Service name for registration
+	ServiceName = "EVALHUB"
+
+	// Default image configuration
+	defaultEvalHubImage = "quay.io/evalhub/evalhub:latest"
+
+	// Container configuration
+	containerName = "evalhub"
+	containerPort = 8443
+
+	// Service configuration
+	serviceName = "evalhub"
+	servicePort = 8443
+
+	// Configuration constants
+	configMapName            = "trustyai-service-operator-config"
+	configMapEvalHubImageKey = "evalHubImage"
+
+	// TLS configuration (OpenShift service serving certificates)
+	tlsSecretMountPath = "/etc/tls/private"
+	tlsCertFile        = "tls.crt"
+	tlsKeyFile         = "tls.key"
+
+	// Route configuration
+	routeName = "evalhub"
+
+	// Database configuration
+	dbSecretVolumeName = "evalhub-db-secret"
+	dbSecretMountPath  = "/etc/evalhub/secrets"
+	dbSecretKey        = "db-url"
+	dbDriver           = "pgx"
+	dbDefaultMaxOpen   = 25
+	dbDefaultMaxIdle   = 5
+
+	// Service CA configuration
+	serviceCAVolumeName = "service-ca"
+	serviceCAMountPath  = "/etc/evalhub/ca"
+	serviceCACertFile   = "service-ca.crt"
+
+	// MLFlow projected token configuration
+	mlflowTokenVolumeName = "mlflow-token"
+	mlflowTokenMountPath  = "/var/run/secrets/mlflow"
+	mlflowTokenFile       = "token"
+	mlflowTokenExpiration = 3600 // seconds
+
+	// EvalHub config directory (contains config.yaml and providers/ subdir)
+	configDirPath = "/etc/evalhub/config"
+
+	// Provider ConfigMap configuration
+	providerLabel       = "trustyai.opendatahub.io/evalhub-provider-type"
+	providerNameLabel   = "trustyai.opendatahub.io/evalhub-provider-name"
+	providersVolumeName = "evalhub-providers"
+	providersMountPath  = configDirPath + "/providers"
+
+	// Sidecar configuration
+	sidecarBaseURL = "http://localhost:8080"
+
+	// Collection ConfigMap configuration
+	collectionLabel       = "trustyai.opendatahub.io/evalhub-collection-type"
+	collectionNameLabel   = "trustyai.opendatahub.io/evalhub-collection-name"
+	collectionsVolumeName = "evalhub-collections"
+	collectionsMountPath  = configDirPath + "/collections"
+)
+
+var (
+	// Default resource requirements based on k8s examples
+	defaultResourceRequirements = corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("500m"),
+			corev1.ResourceMemory: resource.MustParse("512Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("2000m"),
+			corev1.ResourceMemory: resource.MustParse("2Gi"),
+		},
+	}
+
+	// Default security context
+	allowPrivilegeEscalation = false
+	runAsNonRoot             = true
+	defaultSecurityContext   = &corev1.SecurityContext{
+		AllowPrivilegeEscalation: &allowPrivilegeEscalation,
+		RunAsNonRoot:             &runAsNonRoot,
+		// RunAsUser omitted to let OpenShift assign from allowed range
+		Capabilities: &corev1.Capabilities{
+			Drop: []corev1.Capability{
+				"ALL",
+			},
+		},
+		SeccompProfile: &corev1.SeccompProfile{
+			Type: corev1.SeccompProfileTypeRuntimeDefault,
+		},
+	}
+
+	// Default pod security context
+	runAsNonRootUser          = true
+	defaultPodSecurityContext = &corev1.PodSecurityContext{
+		RunAsNonRoot: &runAsNonRootUser,
+		// FSGroup omitted to let OpenShift assign from allowed range
+		SeccompProfile: &corev1.SeccompProfile{
+			Type: corev1.SeccompProfileTypeRuntimeDefault,
+		},
+	}
+)

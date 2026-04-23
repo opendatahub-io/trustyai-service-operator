@@ -2,21 +2,14 @@ package gorch
 
 import (
 	"context"
-	"fmt"
-	"reflect"
-	"time"
-
 	gorchv1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/gorch/v1alpha1"
 	"github.com/trustyai-explainability/trustyai-service-operator/controllers/constants"
 	templateParser "github.com/trustyai-explainability/trustyai-service-operator/controllers/gorch/templates"
+	"github.com/trustyai-explainability/trustyai-service-operator/controllers/utils"
 	appsv1 "k8s.io/api/apps/v1"
+	"reflect"
+	"strings"
 
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/util/retry"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -30,16 +23,17 @@ type ContainerImages struct {
 }
 
 type DeploymentConfig struct {
-	Orchestrator           *gorchv1alpha1.GuardrailsOrchestrator
-	ContainerImages        ContainerImages
-	OrchestratorOAuthProxy *OAuthConfig
-	GatewayOAuthProxy      *OAuthConfig
+	Orchestrator              *gorchv1alpha1.GuardrailsOrchestrator
+	ContainerImages           ContainerImages
+	OrchestratorKubeRBACProxy *utils.KubeRBACProxyConfig
+	GatewayKubeRBACProxy      *utils.KubeRBACProxyConfig
+	BuiltInKubeRBACProxy      *utils.KubeRBACProxyConfig
 }
 
 func (r *GuardrailsOrchestratorReconciler) createDeployment(ctx context.Context, orchestrator *gorchv1alpha1.GuardrailsOrchestrator) (*appsv1.Deployment, error) {
 	var containerImages ContainerImages
 
-	orchestratorImage, err := r.getImageFromConfigMap(ctx, orchestratorImageKey, constants.ConfigMap, r.Namespace)
+	orchestratorImage, err := utils.GetImageFromConfigMap(ctx, r.Client, orchestratorImageKey, constants.ConfigMap, r.Namespace)
 	if orchestratorImage == "" || err != nil {
 		log.FromContext(ctx).Error(err, "Error getting container image from ConfigMap.")
 		return nil, err
@@ -49,7 +43,7 @@ func (r *GuardrailsOrchestratorReconciler) createDeployment(ctx context.Context,
 
 	// Check if the regex detectors are enabled
 	if orchestrator.Spec.EnableBuiltInDetectors {
-		detectorImage, err := r.getImageFromConfigMap(ctx, detectorImageKey, constants.ConfigMap, r.Namespace)
+		detectorImage, err := utils.GetImageFromConfigMap(ctx, r.Client, detectorImageKey, constants.ConfigMap, r.Namespace)
 		if detectorImage == "" || err != nil {
 			log.FromContext(ctx).Error(err, "Error getting detectors image from ConfigMap.")
 			return nil, err
@@ -57,84 +51,54 @@ func (r *GuardrailsOrchestratorReconciler) createDeployment(ctx context.Context,
 		log.FromContext(ctx).Info("Using detector image " + detectorImage + " " + "from configmap " + r.Namespace + ":" + constants.ConfigMap)
 		containerImages.DetectorImage = detectorImage
 	}
+
 	// Check if the guardrails sidecar gateway is enabled
 	if orchestrator.Spec.EnableGuardrailsGateway {
-		guardrailsGatewayImage, err := r.getImageFromConfigMap(ctx, gatewayImageKey, constants.ConfigMap, r.Namespace)
+		guardrailsGatewayImage, err := utils.GetImageFromConfigMap(ctx, r.Client, gatewayImageKey, constants.ConfigMap, r.Namespace)
 		if guardrailsGatewayImage == "" || err != nil {
 			log.FromContext(ctx).Error(err, "Error getting guardrails sidecar gateway image from ConfigMap.")
 		}
 		log.FromContext(ctx).Info("Using sidecar gateway image " + guardrailsGatewayImage + " " + "from configmap " + r.Namespace + ":" + constants.ConfigMap)
-
 		containerImages.GuardrailsGatewayImage = guardrailsGatewayImage
 	}
 
 	deploymentConfig := DeploymentConfig{
-		Orchestrator:           orchestrator,
-		ContainerImages:        containerImages,
-		OrchestratorOAuthProxy: nil,
-		GatewayOAuthProxy:      nil,
+		Orchestrator:              orchestrator,
+		ContainerImages:           containerImages,
+		OrchestratorKubeRBACProxy: nil,
+		GatewayKubeRBACProxy:      nil,
 	}
 
-	if requiresOAuth(orchestrator) {
-		if err = r.configureOAuth(ctx, orchestrator, &deploymentConfig); err != nil {
-			log.FromContext(ctx).Error(err, "Error configuring OAuth.")
+	if utils.RequiresAuth(orchestrator) {
+		if err = r.configureKubeRBACProxy(ctx, orchestrator, &deploymentConfig); err != nil {
+			log.FromContext(ctx).Error(err, "Error configuring Kube-RBAC-Proxy.")
 			return nil, err
 		}
 	}
 
 	var deployment *appsv1.Deployment
-	deployment, err = templateParser.ParseResource[appsv1.Deployment](deploymentTemplatePath, deploymentConfig, reflect.TypeOf(&appsv1.Deployment{}))
+	deployment, err = templateParser.ParseResource[*appsv1.Deployment](deploymentTemplatePath, deploymentConfig, reflect.TypeOf(&appsv1.Deployment{}))
 	if err != nil {
 		log.FromContext(ctx).Error(err, "Failed to parse deployment template")
 		return nil, err
 	}
+
+	// add env vars to the deployment
+	if orchestrator.Spec.EnvVars != nil && len(*orchestrator.Spec.EnvVars) > 0 {
+		for i := range deployment.Spec.Template.Spec.Containers {
+			if !isKubeRBACProxyContainer(deployment.Spec.Template.Spec.Containers[i].Name) {
+				deployment.Spec.Template.Spec.Containers[i].Env = append(
+					deployment.Spec.Template.Spec.Containers[i].Env,
+					*orchestrator.Spec.EnvVars...)
+			}
+		}
+	}
+
 	if err := controllerutil.SetControllerReference(orchestrator, deployment, r.Scheme); err != nil {
 		log.FromContext(ctx).Error(err, "Failed to set controller reference for deployment")
 		return nil, err
 	}
 	return deployment, nil
-}
-
-func (r *GuardrailsOrchestratorReconciler) checkDeploymentReady(ctx context.Context, orchestrator *gorchv1alpha1.GuardrailsOrchestrator) (bool, error) {
-	var err error
-	var deployment *appsv1.Deployment
-	err = retry.OnError(
-		wait.Backoff{
-			Duration: 5 * time.Second,
-		},
-		func(err error) bool {
-			return errors.IsNotFound(err) || err != nil
-		},
-		func() error {
-			err = r.Get(ctx, types.NamespacedName{Name: orchestrator.Name, Namespace: orchestrator.Namespace}, deployment)
-			if err != nil {
-				return err
-			}
-			for _, condition := range deployment.Status.Conditions {
-				if condition.Type == appsv1.DeploymentAvailable && condition.Status == "True" {
-					err = r.checkPodsReady(ctx, *deployment)
-				}
-			}
-			return fmt.Errorf("deployment %s is not ready", deployment.Name)
-		},
-	)
-	return true, nil
-}
-
-func (r GuardrailsOrchestratorReconciler) checkPodsReady(ctx context.Context, deployment appsv1.Deployment) error {
-	podList := &corev1.PodList{}
-	if err := r.List(ctx, podList, client.InNamespace(deployment.Namespace)); err != nil {
-		return err
-	}
-	// check if all pods are all ready
-	for _, pod := range podList.Items {
-		for _, cs := range pod.Status.ContainerStatuses {
-			if !cs.Ready {
-				return fmt.Errorf("pod %s is not ready", pod.Name)
-			}
-		}
-	}
-	return nil
 }
 
 // addTLSMounts adds secret mounts for each TLS serving secret required by the orchestrator
@@ -144,7 +108,7 @@ func (r GuardrailsOrchestratorReconciler) addTLSMounts(ctx context.Context, orch
 			MountSecret(deployment, tlsMounts[i].TLSSecret)
 
 			// validate that the TLS serving secrets indeed exist before creating deployment
-			_, err := getSecret(ctx, r.Client, orchestrator.Namespace, tlsMounts[i].TLSSecret)
+			_, err := utils.GetSecret(ctx, r.Client, tlsMounts[i].TLSSecret, orchestrator.Namespace)
 			if err != nil {
 				return err
 			}
@@ -174,4 +138,9 @@ func patchDeployment(existingDeployment, newDeployment *appsv1.Deployment) bool 
 	}
 
 	return changed
+}
+
+// isKubeRBACProxyContainer checks if a pod name corresponding to a kube-rbac-proxy pod
+func isKubeRBACProxyContainer(name string) bool {
+	return strings.HasPrefix(name, "kube-rbac-proxy")
 }

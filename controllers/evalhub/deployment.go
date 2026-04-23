@@ -1,0 +1,394 @@
+package evalhub
+
+import (
+	"context"
+	"fmt"
+
+	evalhubv1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/evalhub/v1alpha1"
+	"github.com/trustyai-explainability/trustyai-service-operator/controllers/utils"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+// reconcileDeployment creates or updates the Deployment for EvalHub
+func (r *EvalHubReconciler) reconcileDeployment(ctx context.Context, instance *evalhubv1alpha1.EvalHub, providerCMNames []string, collectionCMNames []string) error {
+	log := log.FromContext(ctx)
+	log.Info("Reconciling Deployment", "name", instance.Name)
+
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      instance.Name,
+			Namespace: instance.Namespace,
+		},
+	}
+
+	// Check if Deployment already exists
+	getErr := r.Get(ctx, client.ObjectKeyFromObject(deployment), deployment)
+	if getErr != nil && !errors.IsNotFound(getErr) {
+		return getErr
+	}
+
+	// Define the desired deployment spec
+	desiredSpec, err := r.buildDeploymentSpec(ctx, instance, providerCMNames, collectionCMNames)
+	if err != nil {
+		return err
+	}
+
+	if errors.IsNotFound(getErr) {
+		// Create new Deployment
+		deployment.Spec = desiredSpec
+		if err := controllerutil.SetControllerReference(instance, deployment, r.Scheme); err != nil {
+			return err
+		}
+		log.Info("Creating Deployment", "name", deployment.Name)
+		return r.Create(ctx, deployment)
+	} else {
+		// Update existing Deployment
+		deployment.Spec = desiredSpec
+		if err := controllerutil.SetControllerReference(instance, deployment, r.Scheme); err != nil {
+			return err
+		}
+		log.Info("Updating Deployment", "name", deployment.Name)
+		return r.Update(ctx, deployment)
+	}
+}
+
+// buildDeploymentSpec builds the deployment specification for EvalHub
+func (r *EvalHubReconciler) buildDeploymentSpec(ctx context.Context, instance *evalhubv1alpha1.EvalHub, providerCMNames []string, collectionCMNames []string) (appsv1.DeploymentSpec, error) {
+	labels := map[string]string{
+		"app":       "eval-hub",
+		"instance":  instance.Name,
+		"component": "api",
+	}
+
+	// Get image from ConfigMap with fallback
+	evalHubImage, err := r.getEvalHubImage(ctx)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "Error getting EvalHub image from ConfigMap. Using the default image value of "+defaultEvalHubImage)
+		evalHubImage = defaultEvalHubImage
+	}
+
+	// Build default environment variables
+	// EvalHub serves TLS directly using OpenShift service serving certificates.
+	// Auth is handled internally via SAR checks.
+	defaultEnvVars := []corev1.EnvVar{
+		{
+			Name:  "API_HOST",
+			Value: "0.0.0.0",
+		},
+		{
+			Name:  "PORT",
+			Value: fmt.Sprintf("%d", containerPort),
+		},
+		{
+			Name:  "TLS_CERT_FILE",
+			Value: tlsSecretMountPath + "/" + tlsCertFile,
+		},
+		{
+			Name:  "TLS_KEY_FILE",
+			Value: tlsSecretMountPath + "/" + tlsKeyFile,
+		},
+		{
+			Name:  "LOG_LEVEL",
+			Value: "INFO",
+		},
+		{
+			Name:  "MAX_CONCURRENT_EVALUATIONS",
+			Value: "10",
+		},
+		{
+			Name:  "DEFAULT_TIMEOUT_MINUTES",
+			Value: "60",
+		},
+		{
+			Name:  "MAX_RETRY_ATTEMPTS",
+			Value: "3",
+		},
+		{
+			Name:  "EVAL_HUB_CONFIG_DIR",
+			Value: configDirPath,
+		},
+		{
+			Name:  "SERVICE_URL",
+			Value: fmt.Sprintf("https://%s.%s.svc.cluster.local:8443", instance.Name, instance.Namespace),
+		},
+		{
+			Name:  "EVALHUB_INSTANCE_NAME",
+			Value: instance.Name,
+		},
+		{
+			Name:  "MLFLOW_CA_CERT_PATH",
+			Value: serviceCAMountPath + "/" + serviceCACertFile,
+		},
+		{
+			Name:  "MLFLOW_WORKSPACE",
+			Value: instance.Namespace,
+		},
+		{
+			Name:  "MLFLOW_TOKEN_PATH",
+			Value: mlflowTokenMountPath + "/" + mlflowTokenFile,
+		},
+	}
+
+	// Merge environment variables with CR values taking precedence
+	env := mergeEnvVars(defaultEnvVars, instance.Spec.Env)
+
+	// Build volume mounts for the evalhub container
+	volumeMounts := []corev1.VolumeMount{
+		{
+			Name:      "evalhub-config",
+			MountPath: configDirPath,
+			ReadOnly:  true,
+		},
+		{
+			Name:      serviceCAVolumeName,
+			MountPath: serviceCAMountPath,
+			ReadOnly:  true,
+		},
+		{
+			Name:      mlflowTokenVolumeName,
+			MountPath: mlflowTokenMountPath,
+			ReadOnly:  true,
+		},
+	}
+	// TLS volume mount for OpenShift service serving certificates
+	volumeMounts = append(volumeMounts, corev1.VolumeMount{
+		Name:      instance.Name + "-tls",
+		MountPath: tlsSecretMountPath,
+		ReadOnly:  true,
+	})
+	if len(providerCMNames) > 0 {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      providersVolumeName,
+			MountPath: providersMountPath,
+			ReadOnly:  true,
+		})
+	}
+	if len(collectionCMNames) > 0 {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      collectionsVolumeName,
+			MountPath: collectionsMountPath,
+			ReadOnly:  true,
+		})
+	}
+	if instance.Spec.IsPostgreSQL() {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      dbSecretVolumeName,
+			MountPath: dbSecretMountPath,
+			ReadOnly:  true,
+		})
+	}
+	// Container definition
+	container := corev1.Container{
+		Name:            containerName,
+		Image:           evalHubImage,
+		ImagePullPolicy: corev1.PullAlways,
+		Ports: []corev1.ContainerPort{
+			{
+				Name:          "https",
+				ContainerPort: containerPort,
+				Protocol:      corev1.ProtocolTCP,
+			},
+		},
+		Env:             env,
+		Resources:       defaultResourceRequirements,
+		SecurityContext: defaultSecurityContext,
+		VolumeMounts:    volumeMounts,
+		// HTTPGet probes with HTTPS scheme — kubelet skips TLS verification for probe requests.
+		LivenessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path:   "/api/v1/health",
+					Port:   intstr.FromInt(containerPort),
+					Scheme: corev1.URISchemeHTTPS,
+				},
+			},
+			InitialDelaySeconds: 30,
+			PeriodSeconds:       10,
+			TimeoutSeconds:      5,
+			FailureThreshold:    3,
+		},
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path:   "/api/v1/health",
+					Port:   intstr.FromInt(containerPort),
+					Scheme: corev1.URISchemeHTTPS,
+				},
+			},
+			InitialDelaySeconds: 10,
+			PeriodSeconds:       5,
+			TimeoutSeconds:      3,
+			FailureThreshold:    3,
+		},
+	}
+
+	// Build volumes list
+	volumes := []corev1.Volume{
+		{
+			Name: "evalhub-config",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: instance.Name + "-config",
+					},
+				},
+			},
+		},
+		{
+			Name: instance.Name + "-tls",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: instance.Name + "-tls",
+				},
+			},
+		},
+		{
+			Name: serviceCAVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: instance.Name + "-service-ca",
+					},
+				},
+			},
+		},
+		{
+			Name: mlflowTokenVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				Projected: &corev1.ProjectedVolumeSource{
+					Sources: []corev1.VolumeProjection{
+						{
+							ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+								Path:              mlflowTokenFile,
+								ExpirationSeconds: func() *int64 { e := int64(mlflowTokenExpiration); return &e }(),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	if len(providerCMNames) > 0 {
+		volumes = append(volumes, corev1.Volume{
+			Name: providersVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				Projected: &corev1.ProjectedVolumeSource{
+					Sources: providerVolumeProjections(providerCMNames),
+				},
+			},
+		})
+	}
+	if len(collectionCMNames) > 0 {
+		volumes = append(volumes, corev1.Volume{
+			Name: collectionsVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				Projected: &corev1.ProjectedVolumeSource{
+					Sources: collectionVolumeProjections(collectionCMNames),
+				},
+			},
+		})
+	}
+	if instance.Spec.IsPostgreSQL() {
+		volumes = append(volumes, corev1.Volume{
+			Name: dbSecretVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: instance.Spec.Database.Secret,
+					Items: []corev1.KeyToPath{
+						{Key: dbSecretKey, Path: dbSecretKey},
+					},
+					DefaultMode: func() *int32 { i := int32(420); return &i }(),
+				},
+			},
+		})
+	}
+	// Pod template with EvalHub container and required volumes
+	podTemplate := corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: labels,
+		},
+		Spec: corev1.PodSpec{
+			ServiceAccountName: generateServiceAccountName(instance),
+			Containers:         []corev1.Container{container},
+			SecurityContext:    defaultPodSecurityContext,
+			RestartPolicy:      corev1.RestartPolicyAlways,
+			Volumes:            volumes,
+		},
+	}
+
+	// Deployment spec
+	replicas := instance.Spec.GetReplicas()
+	return appsv1.DeploymentSpec{
+		Replicas: &replicas,
+		Selector: &metav1.LabelSelector{
+			MatchLabels: labels,
+		},
+		Template: podTemplate,
+		Strategy: appsv1.DeploymentStrategy{
+			Type: appsv1.RollingUpdateDeploymentStrategyType,
+			RollingUpdate: &appsv1.RollingUpdateDeployment{
+				MaxUnavailable: &intstr.IntOrString{
+					Type:   intstr.String,
+					StrVal: "25%",
+				},
+				MaxSurge: &intstr.IntOrString{
+					Type:   intstr.String,
+					StrVal: "25%",
+				},
+			},
+		},
+	}, nil
+}
+
+// getEvalHubImage retrieves the EvalHub image from ConfigMap with fallback to default
+func (r *EvalHubReconciler) getEvalHubImage(ctx context.Context) (string, error) {
+	// Get the namespace where the operator is deployed (where the ConfigMap should be)
+	namespace := r.Namespace
+	if namespace == "" {
+		// Fallback to default namespace if not set
+		namespace = "trustyai-service-operator-system"
+	}
+
+	return utils.GetImageFromConfigMapWithFallback(ctx, r.Client, configMapEvalHubImageKey, configMapName, namespace, defaultEvalHubImage)
+}
+
+// mergeEnvVars merges default environment variables with CR-specified ones,
+// with CR values taking precedence over defaults when names conflict
+func mergeEnvVars(defaults, overrides []corev1.EnvVar) []corev1.EnvVar {
+	// Build map of environment variables starting with defaults
+	envMap := make(map[string]corev1.EnvVar)
+	for _, env := range defaults {
+		envMap[env.Name] = env
+	}
+
+	// Overlay CR-specified values (they win over defaults)
+	for _, env := range overrides {
+		envMap[env.Name] = env
+	}
+
+	// Reconstruct slice preserving order: CR values first, then remaining defaults
+	var result []corev1.EnvVar
+
+	// Add CR values in their original order
+	crNames := make(map[string]bool)
+	for _, env := range overrides {
+		result = append(result, envMap[env.Name])
+		crNames[env.Name] = true
+	}
+
+	// Add remaining defaults that weren't overridden
+	for _, env := range defaults {
+		if !crNames[env.Name] {
+			result = append(result, envMap[env.Name])
+		}
+	}
+
+	return result
+}

@@ -12,6 +12,12 @@ func IsDeploymentReady(deployment *appsv1.Deployment) bool {
 		deployment.Status.Replicas == deployment.Status.AvailableReplicas
 }
 
+// StringPointer makes a copy of the provided string and returns a pointer to the copy
+func StringPointer(s string) *string {
+	newStr := s
+	return &newStr
+}
+
 // containsString checks if a list contains a string
 func ContainsString(list []string, s string) bool {
 	for _, v := range list {
@@ -31,6 +37,16 @@ func RemoveString(list []string, s string) []string {
 		}
 	}
 	return newList
+}
+
+// allTrue checks if all values in a bool array are true, returns false otherwise
+func AllTrue(array []bool) bool {
+	for _, b := range array {
+		if !b {
+			return false
+		}
+	}
+	return true
 }
 
 // GetNamespace returns the namespace of a pod

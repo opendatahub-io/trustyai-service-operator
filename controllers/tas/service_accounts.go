@@ -2,13 +2,12 @@ package tas
 
 import (
 	"context"
+	"github.com/trustyai-explainability/trustyai-service-operator/controllers/utils"
 
 	trustyaiopendatahubiov1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/tas/v1alpha1"
 	"github.com/trustyai-explainability/trustyai-service-operator/controllers/constants"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/json"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	corev1 "k8s.io/api/core/v1"
@@ -21,46 +20,14 @@ func generateServiceAccountName(instance *trustyaiopendatahubiov1alpha1.TrustyAI
 	return instance.Name + "-proxy"
 }
 
-// createServiceAccount creates a service account for this instance's OAuth proxy
+// createServiceAccount creates a service account for this instance's kube-rbac-proxy
 func (r *TrustyAIServiceReconciler) createServiceAccount(ctx context.Context, instance *trustyaiopendatahubiov1alpha1.TrustyAIService) error {
-	routeName := instance.Name
 	serviceAccountName := generateServiceAccountName(instance)
-
-	// Define the OAuth redirect reference
-	oauthRedirectRef := struct {
-		Kind       string `json:"kind"`
-		APIVersion string `json:"apiVersion"`
-		Reference  struct {
-			Kind string `json:"kind"`
-			Name string `json:"name"`
-		} `json:"reference"`
-	}{
-		Kind:       "OAuthRedirectReference",
-		APIVersion: "v1",
-		Reference: struct {
-			Kind string `json:"kind"`
-			Name string `json:"name"`
-		}{
-			Kind: "Route",
-			Name: routeName,
-		},
-	}
-
-	// Marshal the struct into JSON format for the annotation
-	oauthRedirectRefJSON, err := json.Marshal(oauthRedirectRef)
-
-	if err != nil {
-		// Handle error
-		return err
-	}
 
 	sa := &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      serviceAccountName,
 			Namespace: instance.Namespace,
-			Annotations: map[string]string{
-				"serviceaccounts.openshift.io/oauth-redirectreference.primary": string(oauthRedirectRefJSON),
-			},
 			Labels: map[string]string{
 				"app":                        componentName,
 				"app.kubernetes.io/name":     serviceAccountName,
@@ -78,7 +45,7 @@ func (r *TrustyAIServiceReconciler) createServiceAccount(ctx context.Context, in
 
 	// Check if this ServiceAccount already exists
 	found := &corev1.ServiceAccount{}
-	err = r.Get(ctx, types.NamespacedName{Name: sa.Name, Namespace: sa.Namespace}, found)
+	err := r.Get(ctx, types.NamespacedName{Name: sa.Name, Namespace: sa.Namespace}, found)
 	if err != nil && errors.IsNotFound(err) {
 		log.FromContext(ctx).Info("Creating a new ServiceAccount", "Namespace", sa.Namespace, "Name", sa.Name)
 		err = r.Create(ctx, sa)
@@ -118,22 +85,8 @@ func (r *TrustyAIServiceReconciler) createClusterRoleBinding(ctx context.Context
 		},
 	}
 
-	// Set instance as the owner of the ClusterRoleBinding
-	if err := controllerutil.SetControllerReference(instance, clusterRoleBinding, r.Scheme); err != nil {
+	if err := utils.ReconcileClusterRoleBinding(ctx, r.Client, instance, clusterRoleBinding); err != nil {
 		return err
 	}
-
-	// Check if this ClusterRoleBinding already exists
-	found := &rbacv1.ClusterRoleBinding{}
-	err := r.Get(ctx, types.NamespacedName{Name: clusterRoleBinding.Name}, found)
-	if err != nil && errors.IsNotFound(err) {
-		log.FromContext(ctx).Info("Creating a new ClusterRoleBinding", "Name", clusterRoleBinding.Name)
-		err = r.Create(ctx, clusterRoleBinding)
-		if err != nil {
-			log.FromContext(ctx).Error(err, "Error creating a new ClusterRoleBinding")
-			return err
-		}
-	}
-
 	return nil
 }

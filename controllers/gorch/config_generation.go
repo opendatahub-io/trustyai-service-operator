@@ -8,7 +8,9 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/kserve/kserve/pkg/apis/serving/v1alpha1"
 	kservev1beta1 "github.com/kserve/kserve/pkg/apis/serving/v1beta1"
+	"github.com/trustyai-explainability/trustyai-service-operator/api/common"
 	gorchv1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/gorch/v1alpha1"
+	"github.com/trustyai-explainability/trustyai-service-operator/controllers/utils"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -19,6 +21,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sort"
 	"strconv"
 	"strings"
@@ -151,45 +154,71 @@ func (r *GuardrailsOrchestratorReconciler) getInferenceServicesAndServingRuntime
 	if err := r.List(ctx, &servingRuntimes, &client.ListOptions{
 		Namespace: namespace,
 	}); err != nil || len(servingRuntimes.Items) == 0 {
+		if len(servingRuntimes.Items) == 0 {
+			err = fmt.Errorf("no ServingRuntimes found in namespace %s", namespace)
+		}
+		log.FromContext(ctx).Error(err, "could not list all ServingRuntimes in", "namespace", namespace)
 		return kservev1beta1.InferenceServiceList{}, v1alpha1.ServingRuntimeList{}, fmt.Errorf("could not automatically find serving runtimes: %w", err)
 	}
-
 	return inferenceServices, servingRuntimes, nil
 }
 
+// getServiceByName retrieves a Service with the given name in the specified namespace.
+func getServiceByName(ctx context.Context, c client.Client, name, namespace string) (*corev1.Service, error) {
+	svc := &corev1.Service{}
+	err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, svc)
+	if err != nil {
+		return nil, err
+	}
+	return svc, nil
+}
+
 // extractInferenceServiceInfo reads an inference service (and corresponding serving runtime) to determine the ISVC's protocol, URL, and port
-func (r *GuardrailsOrchestratorReconciler) extractInferenceServiceInfo(ctx context.Context, namespace string, isvc kservev1beta1.InferenceService, servingRuntimes v1alpha1.ServingRuntimeList) (*gorchv1alpha1.DetectedService, error) {
+func (r *GuardrailsOrchestratorReconciler) extractInferenceServiceInfo(ctx context.Context, namespace string, isvc kservev1beta1.InferenceService, servingRuntimes v1alpha1.ServingRuntimeList, orchestrator *gorchv1alpha1.GuardrailsOrchestrator) (*gorchv1alpha1.DetectedService, error) {
 	log := ctrl.Log.WithName("AutoConfigurator | Orchestrator ConfigMap Definer |")
-	url, err := url.Parse(isvc.Status.URL.String())
+
+	// extract the ISVC's URL
+	parsedUrl, err := url.Parse(isvc.Status.URL.String())
 	if err != nil {
 		return nil, fmt.Errorf("could not parse URL %s from generator service status %s", isvc.Status.URL.String(), isvc.Name)
 	}
+	scheme := parsedUrl.Scheme
+	hostname := parsedUrl.Hostname()
+	var port string
 
-	port := url.Port()
-	// if the ISVC is not listing a port, find it from the serving runtime
-	if port == "" {
-		var matchingGenerationRuntime *v1alpha1.ServingRuntime
-		for _, servingRuntime := range servingRuntimes.Items {
-			if servingRuntime.Name == *isvc.Spec.Predictor.Model.Runtime {
-				matchingGenerationRuntime = &servingRuntime
-				break
+	// find the predictor service that matches the ISVC
+	targetService := isvc.Name + "-predictor"
+	svc, err := getServiceByName(ctx, r.Client, targetService, namespace)
+	if err == nil {
+		port = fmt.Sprintf("%d", svc.Spec.Ports[0].Port) //warning: assumes the predictor service only has one port!
+	} else {
+		log.Error(err, fmt.Sprintf("could not find service by name %s in namespace %s, falling back to legacy URL and port extraction logic", targetService, namespace))
+		port = parsedUrl.Port()
+		// if the ISVC is not listing a port, find it from the serving runtime
+		if port == "" {
+			var matchingGenerationRuntime *v1alpha1.ServingRuntime
+			for _, servingRuntime := range servingRuntimes.Items {
+				if servingRuntime.Name == *isvc.Spec.Predictor.Model.Runtime {
+					matchingGenerationRuntime = &servingRuntime
+					break
+				}
 			}
-		}
-		if matchingGenerationRuntime == nil {
-			log.Error(nil, "model service port could not be identified because 1) the InferenceService did not provide a port and 2) no matching ServingRuntime could be found", "inference service", isvc.Name, "expected serving runtime", *isvc.Spec.Predictor.Model.Runtime)
-		} else {
-			port = strconv.Itoa(int(matchingGenerationRuntime.Spec.Containers[0].Ports[0].ContainerPort))
+			if matchingGenerationRuntime == nil {
+				log.Error(nil, "model service port could not be identified because 1) the InferenceService did not provide a port and 2) no matching ServingRuntime could be found", "inference service", isvc.Name, "expected serving runtime", *isvc.Spec.Predictor.Model.Runtime)
+			} else {
+				port = strconv.Itoa(int(matchingGenerationRuntime.Spec.Containers[0].Ports[0].ContainerPort))
+			}
 		}
 	}
 
-	if url.Scheme == "https" {
+	if scheme == "https" {
 		matchingSecret, err := r.findPredictorServingCertSecret(ctx, namespace, isvc.Name)
 		if err != nil {
-			return nil, fmt.Errorf("could not find serving secret for InferenceService %q in namespace %s", isvc.Name, namespace)
+			return nil, err
 		}
-		return &gorchv1alpha1.DetectedService{Name: isvc.Name, Hostname: url.Hostname(), Port: port, Scheme: url.Scheme, Type: generationType, TLSSecret: matchingSecret.Name}, nil
+		return &gorchv1alpha1.DetectedService{Name: isvc.Name, Hostname: hostname, Port: port, Scheme: scheme, Type: generationType, TLSSecret: matchingSecret.Name}, nil
 	} else {
-		return &gorchv1alpha1.DetectedService{Name: isvc.Name, Hostname: url.Hostname(), Port: port, Scheme: url.Scheme, Type: generationType}, nil
+		return &gorchv1alpha1.DetectedService{Name: isvc.Name, Hostname: hostname, Port: port, Scheme: scheme, Type: generationType}, nil
 	}
 }
 
@@ -237,7 +266,7 @@ func (r *GuardrailsOrchestratorReconciler) defineOrchestratorConfigMap(
 	} else {
 		for _, isvc := range allInferenceServices.Items {
 			if isvc.Name == inferenceServiceToGuardrail && isvc.Status.URL != nil {
-				detectedGenerationService, err = r.extractInferenceServiceInfo(ctx, namespace, isvc, allServingRuntimes)
+				detectedGenerationService, err = r.extractInferenceServiceInfo(ctx, namespace, isvc, allServingRuntimes, orchestrator)
 				if err != nil {
 					return nil, nil, nil, nil, err
 				}
@@ -245,7 +274,7 @@ func (r *GuardrailsOrchestratorReconciler) defineOrchestratorConfigMap(
 			}
 		}
 	}
-	if detectedGenerationService.Hostname == "" || detectedGenerationService.Port == "" {
+	if detectedGenerationService == nil || detectedGenerationService.Hostname == "" || detectedGenerationService.Port == "" {
 		return nil, nil, nil, nil, fmt.Errorf("could not find InferenceService with name %q in namespace %s", inferenceServiceToGuardrail, namespace)
 	} else {
 		log.V(2).Info("Generation service resolved", "Generation service", detectedGenerationService)
@@ -274,7 +303,7 @@ func (r *GuardrailsOrchestratorReconciler) defineOrchestratorConfigMap(
 
 	for _, isvc := range sortedDetectorItems {
 		if isvc.Status.URL != nil {
-			detectedDetectorService, err := r.extractInferenceServiceInfo(ctx, namespace, isvc, allServingRuntimes)
+			detectedDetectorService, err := r.extractInferenceServiceInfo(ctx, namespace, isvc, allServingRuntimes, orchestrator)
 			if err != nil {
 				return nil, nil, nil, nil, err
 			}
@@ -317,7 +346,7 @@ func (r *GuardrailsOrchestratorReconciler) defineOrchestratorConfigMap(
 
 	configYaml.WriteString(orchestratorConclusion)
 
-	if requiresOAuth(orchestrator) {
+	if utils.RequiresAuth(orchestrator) {
 		configYaml.WriteString(oauthHeaderRewrite)
 	}
 
@@ -377,7 +406,7 @@ func (r *GuardrailsOrchestratorReconciler) applyOrchestratorConfigMap(ctx contex
 // updateStatusWithOrchestratorConfigInfo populates the orchestrator's status with information about the auto-generated
 // orchestrator config
 func (r *GuardrailsOrchestratorReconciler) updateStatusWithOrchestratorConfigInfo(ctx context.Context, orchestrator *gorchv1alpha1.GuardrailsOrchestrator, configMap corev1.ConfigMap, generationService gorchv1alpha1.DetectedService, detectorServices []gorchv1alpha1.DetectedService) error {
-	orchestrator.Status.Conditions = []gorchv1alpha1.Condition{
+	orchestrator.Status.Conditions = []common.Condition{
 		{
 			Type:    "Available",
 			Status:  "True",
@@ -663,7 +692,7 @@ func (r *GuardrailsOrchestratorReconciler) redeployOnConfigMapChange(
 		if annotations == nil {
 			annotations = map[string]string{}
 		}
-		changedConfigs := r.setConfigMapHashAnnotations(ctx, orchestrator, annotations)
+		changedConfigs := r.setConfigMapHashAnnotations(ctx, orchestrator, annotations, existingConfigMap, existingGatewayConfigMap)
 
 		if len(changedConfigs) > 0 {
 			// refetch deployment
@@ -707,18 +736,35 @@ func (r *GuardrailsOrchestratorReconciler) redeployOnConfigMapChange(
 }
 
 // setConfigMapHashAnnotations applies hashes of the gateway-config and orchestrator-config to the orchestrator deployment, and returns
-// a list of any configmaps that have changed.
+// a list of any configmaps that have changed. When pre-fetched ConfigMaps are provided, they are used directly to avoid redundant
+// API server calls.
 func (r *GuardrailsOrchestratorReconciler) setConfigMapHashAnnotations(
 	ctx context.Context,
 	orchestrator *gorchv1alpha1.GuardrailsOrchestrator,
 	annotations map[string]string,
+	prefetchedCMs ...*corev1.ConfigMap,
 ) []string {
 	var changedConfigs []string
 
+	// Build a lookup map from any pre-fetched ConfigMaps
+	prefetched := make(map[string]*corev1.ConfigMap, len(prefetchedCMs))
+	for _, cm := range prefetchedCMs {
+		if cm != nil {
+			prefetched[cm.Name] = cm
+		}
+	}
+
 	// Orchestrator config hash
 	if getOrchestratorConfigMap(orchestrator) != nil {
-		cm := &corev1.ConfigMap{}
-		if err := r.Get(ctx, types.NamespacedName{Name: *getOrchestratorConfigMap(orchestrator), Namespace: orchestrator.Namespace}, cm); err == nil {
+		cmName := *getOrchestratorConfigMap(orchestrator)
+		cm, ok := prefetched[cmName]
+		if !ok {
+			cm = &corev1.ConfigMap{}
+			if err := r.Get(ctx, types.NamespacedName{Name: cmName, Namespace: orchestrator.Namespace}, cm); err != nil {
+				cm = nil
+			}
+		}
+		if cm != nil {
 			configData := cm.Data["config.yaml"]
 			hash := fmt.Sprintf("%x", sha256.Sum256([]byte(configData)))
 			if annotations["trustyai.opendatahub.io/orchestrator-config-hash"] != hash {
@@ -730,8 +776,15 @@ func (r *GuardrailsOrchestratorReconciler) setConfigMapHashAnnotations(
 
 	// Gateway config hash
 	if orchestrator.Spec.EnableGuardrailsGateway && getGatewayConfigMap(orchestrator) != nil {
-		cm := &corev1.ConfigMap{}
-		if err := r.Get(ctx, types.NamespacedName{Name: *getGatewayConfigMap(orchestrator), Namespace: orchestrator.Namespace}, cm); err == nil {
+		cmName := *getGatewayConfigMap(orchestrator)
+		cm, ok := prefetched[cmName]
+		if !ok {
+			cm = &corev1.ConfigMap{}
+			if err := r.Get(ctx, types.NamespacedName{Name: cmName, Namespace: orchestrator.Namespace}, cm); err != nil {
+				cm = nil
+			}
+		}
+		if cm != nil {
 			configData := cm.Data["config.yaml"]
 			hash := fmt.Sprintf("%x", sha256.Sum256([]byte(configData)))
 			if annotations["trustyai.opendatahub.io/orchestrator-gateway-config-hash"] != hash {

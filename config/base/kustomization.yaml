@@ -1,14 +1,9 @@
 ---
-namePrefix: trustyai-service-operator-
-
 resources:
-  - ../crd
-  - ../rbac
   - ../manager
+  - ../rbac-base
   - ../prometheus
-
-commonLabels:
-  app.kubernetes.io/part-of: trustyai
+  - ../configmaps
 
 configMapGenerator:
   - env: params.env
@@ -35,13 +30,13 @@ vars:
       apiVersion: v1
     fieldref:
       fieldpath: data.trustyaiOperatorImage
-  - name: oauthProxyImage
+  - name: kube-rbac-proxy
     objref:
       kind: ConfigMap
       name: config
       apiVersion: v1
     fieldref:
-      fieldpath: data.oauthProxyImage
+      fieldpath: data.kube-rbac-proxy
   - name: kServeServerless
     objref:
       kind: ConfigMap
@@ -49,3 +44,38 @@ vars:
       apiVersion: v1
     fieldref:
       fieldpath: data.kServeServerless
+  - name: evalHubImage
+    objref:
+      kind: ConfigMap
+      name: config
+      apiVersion: v1
+    fieldref:
+      fieldpath: data.evalHubImage
+  - name: garak-provider-image
+    objref:
+      kind: ConfigMap
+      name: config
+      apiVersion: v1
+    fieldref:
+      fieldpath: data.garak-provider-image
+  - name: evalhub-provider-guidellm-image
+    objref:
+      kind: ConfigMap
+      name: config
+      apiVersion: v1
+    fieldref:
+      fieldpath: data.evalhub-provider-guidellm-image
+  - name: evalhub-provider-lighteval-image
+    objref:
+      kind: ConfigMap
+      name: config
+      apiVersion: v1
+    fieldref:
+      fieldpath: data.evalhub-provider-lighteval-image
+  - name: lmes-pod-image
+    objref:
+      kind: ConfigMap
+      name: config
+      apiVersion: v1
+    fieldref:
+      fieldpath: data.lmes-pod-image
