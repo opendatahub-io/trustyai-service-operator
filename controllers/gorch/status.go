@@ -2,15 +2,14 @@ package gorch
 
 import (
 	"context"
-	"time"
-
+	"errors"
+	"fmt"
 	gorchv1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/gorch/v1alpha1"
+	"github.com/trustyai-explainability/trustyai-service-operator/controllers/utils"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 var (
@@ -20,95 +19,8 @@ var (
 )
 
 const (
-	ConditionReconcileComplete gorchv1alpha1.ConditionType = "ReconcileComplete"
-	ConditionProgessing        gorchv1alpha1.ConditionType = "Progressing"
+	AutoConfigFailed = "AutoConfigFailed"
 )
-
-const (
-	PhaseProgressing = "Progressing"
-	PhaseReady       = "Ready"
-)
-
-const (
-	ReconcileFailed           = "ReconcileFailed"
-	ReconcileInit             = "ReconcileInit"
-	ReconcileCompleted        = "ReconcileCompleted"
-	ReconcileCompletedMessage = "Reconcile completed successfully"
-	ReconcileFailedMessage    = "Reconcile failed"
-)
-
-func SetStatusCondition(conditions *[]gorchv1alpha1.Condition, newCondition gorchv1alpha1.Condition) bool {
-	if conditions == nil {
-		conditions = &[]gorchv1alpha1.Condition{}
-	}
-	existingCondition := GetStatusCondition(*conditions, newCondition.Type)
-	if existingCondition == nil {
-		newCondition.LastTransitionTime = metav1.NewTime(time.Now())
-		*conditions = append(*conditions, newCondition)
-		return true
-	}
-
-	changed := updateCondition(existingCondition, newCondition)
-
-	return changed
-}
-
-func GetStatusCondition(conditions []gorchv1alpha1.Condition, conditionType gorchv1alpha1.ConditionType) *gorchv1alpha1.Condition {
-	for i := range conditions {
-		if conditions[i].Type == conditionType {
-			return &conditions[i]
-		}
-	}
-	return nil
-}
-
-func updateCondition(existingCondition *gorchv1alpha1.Condition, newCondition gorchv1alpha1.Condition) bool {
-	changed := false
-	if existingCondition.Status != newCondition.Status {
-		changed = true
-		existingCondition.Status = newCondition.Status
-		existingCondition.LastTransitionTime = metav1.NewTime(time.Now())
-	}
-	if existingCondition.Reason != newCondition.Reason {
-		changed = true
-		existingCondition.Reason = newCondition.Reason
-
-	}
-	if existingCondition.Message != newCondition.Message {
-		changed = true
-		existingCondition.Message = newCondition.Message
-	}
-	return changed
-}
-
-func SetProgressingCondition(conditions *[]gorchv1alpha1.Condition, reason string, message string) {
-	SetStatusCondition(conditions, gorchv1alpha1.Condition{
-		Type:    ConditionProgessing,
-		Status:  corev1.ConditionTrue,
-		Reason:  reason,
-		Message: message,
-	})
-
-}
-
-func SetResourceCondition(conditions *[]gorchv1alpha1.Condition, component string, reason string, message string, status corev1.ConditionStatus) {
-	condtype := component + "Ready"
-	SetStatusCondition(conditions, gorchv1alpha1.Condition{
-		Type:    gorchv1alpha1.ConditionType(condtype),
-		Status:  status,
-		Reason:  reason,
-		Message: message,
-	})
-}
-
-func SetCompleteCondition(conditions *[]gorchv1alpha1.Condition, status corev1.ConditionStatus, reason, message string) {
-	SetStatusCondition(conditions, gorchv1alpha1.Condition{
-		Type:    ConditionReconcileComplete,
-		Status:  status,
-		Reason:  reason,
-		Message: message,
-	})
-}
 
 func (r *GuardrailsOrchestratorReconciler) updateStatus(ctx context.Context, original *gorchv1alpha1.GuardrailsOrchestrator, update func(saved *gorchv1alpha1.GuardrailsOrchestrator)) (*gorchv1alpha1.GuardrailsOrchestrator, error) {
 	saved := original.DeepCopy()
@@ -125,48 +37,94 @@ func (r *GuardrailsOrchestratorReconciler) updateStatus(ctx context.Context, ori
 	return saved, err
 }
 
-func (r *GuardrailsOrchestratorReconciler) reconcileStatuses(ctx context.Context, orchestrator *gorchv1alpha1.GuardrailsOrchestrator) (ctrl.Result, error) {
-	generatorReady, _ = r.checkGeneratorPresent(ctx, orchestrator.Namespace)
-	deploymentReady, _ = r.checkDeploymentReady(ctx, orchestrator)
-	httpRouteReady, _ := r.checkRouteReady(ctx, orchestrator, "-http")
-	healthRouteReady, _ := r.checkRouteReady(ctx, orchestrator, "-health")
-	routeReady = httpRouteReady && healthRouteReady
-	if generatorReady && deploymentReady && routeReady {
-		_, updateErr := r.updateStatus(ctx, orchestrator, func(saved *gorchv1alpha1.GuardrailsOrchestrator) {
-			SetResourceCondition(&saved.Status.Conditions, "InferenceService", "InferenceServiceReady", "Inference service is ready", corev1.ConditionTrue)
-			SetResourceCondition(&saved.Status.Conditions, "Deployment", "DeploymentReady", "Deployment is ready", corev1.ConditionTrue)
-			SetResourceCondition(&saved.Status.Conditions, "Route", "RouteReady", "Route is ready", corev1.ConditionTrue)
-			SetCompleteCondition(&saved.Status.Conditions, corev1.ConditionTrue, ReconcileCompleted, ReconcileCompletedMessage)
-			saved.Status.Phase = PhaseReady
-		})
-		if updateErr != nil {
-			log.FromContext(ctx).Error(updateErr, "Failed to update status")
-			return ctrl.Result{}, updateErr
-		}
-	} else {
-		_, updateErr := r.updateStatus(ctx, orchestrator, func(saved *gorchv1alpha1.GuardrailsOrchestrator) {
-			if generatorReady {
-				SetResourceCondition(&saved.Status.Conditions, "InferenceService", "InferenceServiceReady", "Inference service is ready", corev1.ConditionTrue)
-			} else {
-				SetResourceCondition(&saved.Status.Conditions, "InferenceService", "InferenceServiceNotReady", "Inference service is not ready", corev1.ConditionFalse)
-			}
-			if deploymentReady {
-				SetResourceCondition(&saved.Status.Conditions, "Deployment", "DeploymentReady", "Deployment is ready", corev1.ConditionTrue)
-			} else {
-				SetResourceCondition(&saved.Status.Conditions, "Deployment", "DeploymentNotReady", "Deployment is not ready", corev1.ConditionFalse)
-			}
-			if routeReady {
-				SetResourceCondition(&saved.Status.Conditions, "Route", "RouteReady", "Route is ready", corev1.ConditionTrue)
-			} else {
-				SetResourceCondition(&saved.Status.Conditions, "Route", "RouteNotReady", "Route is not ready", corev1.ConditionFalse)
-			}
+type StatusUpdate struct {
+	component       string
+	reason          string
+	message         string
+	conditionStatus corev1.ConditionStatus
+}
 
-			SetCompleteCondition(&saved.Status.Conditions, corev1.ConditionFalse, ReconcileFailed, ReconcileFailedMessage)
-		})
-		if updateErr != nil {
-			log.FromContext(ctx).Error(updateErr, "Failed to update status")
-			return ctrl.Result{}, updateErr
+func createUpdate(component string, isReady bool, err error) StatusUpdate {
+	if err != nil {
+		return StatusUpdate{
+			component:       component,
+			reason:          component + "ReadinessCheckFailed",
+			message:         fmt.Sprintf("%s readiness check failed: %v", component, err),
+			conditionStatus: corev1.ConditionFalse,
 		}
 	}
+	if isReady {
+		return StatusUpdate{
+			component:       component,
+			reason:          component + "Ready",
+			message:         fmt.Sprintf("%s is ready", component),
+			conditionStatus: corev1.ConditionTrue,
+		}
+	} else {
+		return StatusUpdate{
+			component:       component,
+			reason:          component + "NotReady",
+			message:         fmt.Sprintf("%s is not ready", component),
+			conditionStatus: corev1.ConditionFalse,
+		}
+	}
+}
+
+func (r *GuardrailsOrchestratorReconciler) reconcileStatuses(ctx context.Context, orchestrator *gorchv1alpha1.GuardrailsOrchestrator) (ctrl.Result, error) {
+	var statusUpdates []StatusUpdate
+	var requiredRoutesReadiness []bool
+	var routeCheckErrors []error
+
+	// Check overall deployment status
+	deploymentReady, deploymentError := utils.CheckDeploymentReady(ctx, r.Client, orchestrator.Name, orchestrator.Namespace)
+	statusUpdates = append(statusUpdates, createUpdate("Deployment", deploymentReady, deploymentError))
+
+	// Orchestrator needed?
+	if !orchestrator.Spec.DisableOrchestrator {
+		generatorReady, generatorError := r.checkGeneratorPresent(ctx, orchestrator.Namespace)
+		statusUpdates = append(statusUpdates, createUpdate("InferenceService", generatorReady, generatorError))
+		httpRouteReady, httpRouteError := utils.CheckRouteReady(ctx, r.Client, orchestrator.Name, orchestrator.Namespace)
+		healthRouteReady, healthRouteError := utils.CheckRouteReady(ctx, r.Client, orchestrator.Name+"-health", orchestrator.Namespace)
+		requiredRoutesReadiness = append(requiredRoutesReadiness, httpRouteReady, healthRouteReady)
+		routeCheckErrors = append(routeCheckErrors, httpRouteError, healthRouteError)
+	}
+
+	// Gateway needed?
+	if orchestrator.Spec.EnableGuardrailsGateway {
+		gatewayRouteReady, gatewayRouteError := utils.CheckRouteReady(ctx, r.Client, orchestrator.Name+"-gateway", orchestrator.Namespace)
+		requiredRoutesReadiness = append(requiredRoutesReadiness, gatewayRouteReady)
+		routeCheckErrors = append(routeCheckErrors, gatewayRouteError)
+	}
+
+	// Detectors needed?
+	if orchestrator.Spec.EnableBuiltInDetectors {
+		detectorRouteReady, detectorRouteError := utils.CheckRouteReady(ctx, r.Client, orchestrator.Name+"-built-in", orchestrator.Namespace)
+		requiredRoutesReadiness = append(requiredRoutesReadiness, detectorRouteReady)
+		routeCheckErrors = append(routeCheckErrors, detectorRouteError)
+	}
+
+	// Check route readiness
+	statusUpdates = append(statusUpdates, createUpdate("Route", utils.AllTrue(requiredRoutesReadiness), errors.Join(routeCheckErrors...)))
+
+	// Apply the new statues
+	_, updateErr := r.updateStatus(ctx, orchestrator, func(saved *gorchv1alpha1.GuardrailsOrchestrator) {
+		allStatusesTrue := true
+		for _, status := range statusUpdates {
+			utils.SetResourceCondition(&saved.Status.Conditions, status.component, status.reason, status.message, status.conditionStatus)
+			allStatusesTrue = allStatusesTrue && status.conditionStatus == corev1.ConditionTrue
+		}
+
+		// If all statuses are true, report the reconciliation as finished
+		if allStatusesTrue {
+			utils.UnsetProgressingCondition(&saved.Status.Conditions, utils.ReconcileCompleted, "")
+			utils.SetCompleteCondition(&saved.Status.Conditions, corev1.ConditionTrue, utils.ReconcileCompleted, "GuardrailsOrchestrator resource successfully initialized")
+			saved.Status.Phase = utils.PhaseReady
+		}
+	})
+	if updateErr != nil {
+		utils.LogErrorUpdating(ctx, updateErr, "status", orchestrator.Name, orchestrator.Namespace)
+		return ctrl.Result{}, updateErr
+	}
+
 	return ctrl.Result{}, nil
 }

@@ -1,42 +1,48 @@
-{{ define "oAuthProxy" }} name: oauth-proxy-{{ .Suffix }}
-          image: {{ .OAuthProxyImage}}
+{{ define "kubeRBACProxy" }} name: kube-rbac-proxy-{{ .Suffix }}
+          image: {{ .KubeRBACProxyImage}}
+          args:
+            - --secure-listen-address=0.0.0.0:{{ .DownstreamPort }}
+            - --upstream={{ .UpstreamProtocol }}://{{ .UpstreamHost }}:{{ .UpstreamPort }}/
+            - --config-file=/etc/kube-rbac-proxy/config.yaml
+            - --tls-cert-file=/etc/tls/private/tls.crt
+            - --tls-private-key-file=/etc/tls/private/tls.key
+            - --upstream-ca-file=/etc/tls/ca/service-ca.crt
+            - --proxy-endpoints-port={{ .HealthPort }}
+            - --v=0
+          ports:
+            - containerPort: {{ .DownstreamPort }}
+              name: https
+              protocol: TCP
+            - containerPort: {{ .HealthPort }}
+              name: proxy-healthz
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .HealthPort }}
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 1
+            successThreshold: 1
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .HealthPort }}
+              scheme: HTTPS
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 1
+            successThreshold: 1
+            failureThreshold: 3
           resources:
             limits:
               cpu: 100m
               memory: 64Mi
             requests:
-              cpu: 100m
-              memory: 64Mi
-          readinessProbe:
-            httpGet:
-              path: /oauth/healthz
-              port: oauth-proxy
-              scheme: HTTPS
-            initialDelaySeconds: 5
-            timeoutSeconds: 1
-            periodSeconds: 5
-            successThreshold: 1
-            failureThreshold: 3
-          livenessProbe:
-            httpGet:
-              path: /oauth/healthz
-              port: oauth-proxy
-              scheme: HTTPS
-            initialDelaySeconds: 30
-            timeoutSeconds: 1
-            periodSeconds: 5
-            successThreshold: 1
-            failureThreshold: 3
-          env:
-            - name: NAMESPACE
-              valueFrom:
-                fieldRef:
-                  apiVersion: v1
-                  fieldPath: metadata.namespace
-          ports:
-            - name: oauth-proxy
-              containerPort: {{ .DownstreamPort }}
-              protocol: TCP
+              cpu: 50m
+              memory: 32Mi
           volumeMounts:
             - name: tls-certs
               mountPath: /etc/tls/private
@@ -44,26 +50,10 @@
             - name: tls-ca-bundle
               mountPath: /etc/tls/ca
               readOnly: true
-          args:
-            - '--cookie-secret=SECRET'
-            - '--https-address=:{{.DownstreamPort}}'
-            - '--http-address='
-            - '--email-domain=*'
-            - '--openshift-service-account={{ .Name }}-serviceaccount'
-            - '--provider=openshift'
-            - '--pass-user-bearer-token'
-            - '--tls-cert=/etc/tls/private/tls.crt'
-            - '--tls-key=/etc/tls/private/tls.key'
-            - '--upstream={{.UpstreamProtocol}}://{{.UpstreamHost}}:{{.UpstreamPort}}'
-            - '--upstream-ca=/etc/tls/ca/service-ca.crt'
-            - '--skip-auth-regex=''(^/apis/v1beta1/healthz)'''
-            - >-
-              --openshift-sar={"namespace":"{{ .Namespace }}","resource":"pods","verb":"get"}
-            - >-
-              --openshift-delegate-urls={"/": {"namespace": "{{ .Namespace }}", "resource":
-              "pods", "verb": "get"}}
+            - name: kube-rbac-proxy-{{ .Suffix }}-config
+              mountPath: /etc/kube-rbac-proxy
+              readOnly: true
 {{ end }}
-
 kind: Deployment
 apiVersion: apps/v1
 metadata:
@@ -122,8 +112,33 @@ spec:
           configMap:
             name: {{.Orchestrator.Name }}-ca-bundle
             defaultMode: 420
+        {{- if .OrchestratorKubeRBACProxy }}
+        - name: kube-rbac-proxy-orchestrator-config
+          configMap:
+            name: {{.Orchestrator.Name}}-kube-rbac-proxy-orchestrator-config
+            defaultMode: 420
+        {{- end }}
+        {{- if .GatewayKubeRBACProxy }}
+        - name: kube-rbac-proxy-gateway-config
+          configMap:
+            name: {{.Orchestrator.Name}}-kube-rbac-proxy-gateway-config
+            defaultMode: 420
+        {{- end }}
+        {{- if .BuiltInKubeRBACProxy }}
+        - name: kube-rbac-proxy-built-in-config
+          configMap:
+            name: {{.Orchestrator.Name}}-kube-rbac-proxy-built-in-config
+            defaultMode: 420
+        {{- end }}
+{{- if .Orchestrator.Spec.CustomDetectorsConfig }}
+        - name: custom-detectors-config
+          configMap:
+            name: {{.Orchestrator.Spec.CustomDetectorsConfig}}
+            defaultMode: 420
+{{- end }}
       serviceAccountName: {{.Orchestrator.Name}}-serviceaccount
       containers:
+        {{ if not .Orchestrator.Spec.DisableOrchestrator }}
         - name: {{.Orchestrator.Name}}
           image: {{.ContainerImages.OrchestratorImage}}
           env:
@@ -139,27 +154,26 @@ spec:
               value: /etc/tls/private/tls.key
             - name: RUST_LOG
               value: '{{if .Orchestrator.Spec.LogLevel}}{{.Orchestrator.Spec.LogLevel}}{{else}}info{{end}}'
-            {{- if .Orchestrator.Spec.OtelExporter.Protocol }}
+            {{- if .Orchestrator.Spec.OTelExporter.OTLPProtocol }}
             - name: OTEL_EXPORTER_OTLP_PROTOCOL
-              value: {{.Orchestrator.Spec.OtelExporter.Protocol }}{{end}}
-            {{- if .Orchestrator.Spec.OtelExporter.TracesProtocol }}
-            - name: OTEL_EXPORTER_OTLP_TRACES_PROTOCOL
-              value: {{.Orchestrator.Spec.OtelExporter.TracesProtocol}}{{end}}
-            {{- if .Orchestrator.Spec.OtelExporter.MetricsProtocol }}
-            - name: OTEL_EXPORTER_OTLP_METRICS_PROTOCOL
-              value: {{.Orchestrator.Spec.OtelExporter.MetricsProtocol}}{{end}}
-            {{- if .Orchestrator.Spec.OtelExporter.OTLPEndpoint }}
-            - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: {{.Orchestrator.Spec.OtelExporter.OTLPEndpoint}}{{end}}
-            {{- if .Orchestrator.Spec.OtelExporter.TracesEndpoint}}
+              value: {{.Orchestrator.Spec.OTelExporter.OTLPProtocol}}
+          {{end}}
+          {{if .Orchestrator.Spec.OTelExporter.OTLPTracesEndpoint}}
             - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
-              value: {{.Orchestrator.Spec.OtelExporter.TracesEndpoint}}{{end}}
-            {{- if .Orchestrator.Spec.OtelExporter.MetricsEndpoint}}
+              value: {{.Orchestrator.Spec.OTelExporter.OTLPTracesEndpoint}}{{end}}
+            {{- if .Orchestrator.Spec.OTelExporter.OTLPMetricsEndpoint}}
             - name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
-              value: {{.Orchestrator.Spec.OtelExporter.MetricsEndpoint}}{{end}}
-            {{- if .Orchestrator.Spec.OtelExporter.OTLPExport}}
+              value: {{.Orchestrator.Spec.OTelExporter.OTLPMetricsEndpoint}}{{end}}
+            {{- if and .Orchestrator.Spec.OTelExporter.EnableTraces .Orchestrator.Spec.OTelExporter.EnableMetrics}}
             - name: OTLP_EXPORT
-              value: {{.Orchestrator.Spec.OtelExporter.OTLPExport}}{{end}}
+              value: "traces,metrics"
+          {{else if .Orchestrator.Spec.OTelExporter.EnableTraces}}
+            - name: OTLP_EXPORT
+              value: "traces"
+          {{else if .Orchestrator.Spec.OTelExporter.EnableMetrics}}
+            - name: OTLP_EXPORT
+              value: "metrics"
+          {{end}}
           volumeMounts:
             - name: {{.Orchestrator.Name}}-config
               readOnly: true
@@ -194,19 +208,23 @@ spec:
             allowPrivilegeEscalation: false
             seccompProfile:
               type: RuntimeDefault
-            readinessProbe:
-              httpGet:
-                path: /health
-                port: 8033
-                scheme: HTTP
-              initialDelaySeconds: 10
-              timeoutSeconds: 10
-              periodSeconds: 20
-              successThreshold: 1
-              failureThreshold: 3
-            terminationMessagePath: /dev/termination-log
-            command:
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8034
+              scheme: HTTP
+            initialDelaySeconds: 10
+            timeoutSeconds: 10
+            periodSeconds: 20
+            successThreshold: 1
+            failureThreshold: 3
+          terminationMessagePath: /dev/termination-log
+          command:
               - /app/bin/fms-guardrails-orchestr8
+        {{- if .OrchestratorKubeRBACProxy }}
+        - {{- template "kubeRBACProxy" .OrchestratorKubeRBACProxy }}
+        {{- end }}
+        {{ end }}
         {{ if .Orchestrator.Spec.EnableGuardrailsGateway }}
         - name: {{.Orchestrator.Name}}-gateway
           image: {{.ContainerImages.GuardrailsGatewayImage}}
@@ -229,15 +247,22 @@ spec:
               value: '{{if .Orchestrator.Spec.LogLevel}}{{.Orchestrator.Spec.LogLevel}}{{else}}info{{end}}'
             - name: GATEWAY_USE_MTLS
               value: 'false'
-        {{ if .GatewayOAuthProxy }}
-        - {{- template "oAuthProxy" .GatewayOAuthProxy }}
+        {{ if .GatewayKubeRBACProxy }}
+        - {{- template "kubeRBACProxy" .GatewayKubeRBACProxy }}
         {{end}}
         {{end}}
         {{ if .Orchestrator.Spec.EnableBuiltInDetectors }}
         - name: {{.Orchestrator.Name}}-detectors
           image: {{.ContainerImages.DetectorImage}}
           command: [ "/app/bin/regex-detector" ]
+          {{ if .Orchestrator.Spec.CustomDetectorsConfig }}
+          volumeMounts:
+            - name: custom-detectors-config
+              readOnly: true
+              mountPath: /app/custom_detectors/custom_detectors.py
+              subPath: custom_detectors.py
+          {{end}}
+        {{ if .BuiltInKubeRBACProxy }}
+        - {{- template "kubeRBACProxy" .BuiltInKubeRBACProxy }}
         {{end}}
-        {{- if .OrchestratorOAuthProxy -}}
-        - {{- template "oAuthProxy" .OrchestratorOAuthProxy }}
         {{end}}

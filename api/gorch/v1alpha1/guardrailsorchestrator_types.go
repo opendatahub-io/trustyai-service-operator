@@ -17,8 +17,8 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"github.com/trustyai-explainability/trustyai-service-operator/api/common"
 	corev1 "k8s.io/api/core/v1"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -43,7 +43,7 @@ type GuardrailsOrchestratorSpec struct {
 	// Important: Run "make" to regenerate code after modifying this file
 	// Number of replicas
 	Replicas int32 `json:"replicas"`
-	// Name of configmap containing generator,detector,and chunker arguments
+	// Name of configmap containing generator, detector, and chunker arguments
 	// +optional
 	OrchestratorConfig *string `json:"orchestratorConfig,omitempty"`
 	// Settings governing the automatic configuration of the orchestrator. Replaces `OrchestratorConfig`.
@@ -52,6 +52,9 @@ type GuardrailsOrchestratorSpec struct {
 	// Boolean flag to enable/disable built-in detectors
 	// +optional
 	EnableBuiltInDetectors bool `json:"enableBuiltInDetectors,omitempty"`
+	// Name of configmap containing user-defined Python detectors. This is only used if EnableBuiltInDetectors is true
+	// +optional
+	CustomDetectorsConfig *string `json:"customDetectorsConfig,omitempty"`
 	// Boolean flag to enable/disable the guardrails sidecar gateway
 	// +optional
 	EnableGuardrailsGateway bool `json:"enableGuardrailsGateway,omitempty"`
@@ -60,52 +63,38 @@ type GuardrailsOrchestratorSpec struct {
 	SidecarGatewayConfig *string `json:"guardrailsGatewayConfig,omitempty"`
 	// List of orchestrator enviroment variables for configuring the OTLP exporter
 	// +optional
-	OtelExporter OtelExporter `json:"otelExporter,omitempty"`
+	OTelExporter OTelExporter `json:"otelExporter,omitempty"`
 	// Set log level in the orchestrator deployment
 	// +optional
 	LogLevel *string `json:"logLevel,omitempty"`
+	// Define TLS secrets to be mounted to the orchestrator. Secrets will be mounted at /etc/tls/$SECRET_NAME
+	// +optional
+	TLSSecrets *[]string `json:"tlsSecrets,omitempty"`
+	// Define environment variables. These will be added to the orchestrator, gateway, and built-in detector pods.
+	EnvVars *[]corev1.EnvVar `json:"env,omitempty"`
+	//  Boolean flag to disable the orchestrator container, if running the built-in detectors in standalone mode
+	// +optional
+	DisableOrchestrator bool `json:"disableOrchestrator,omitempty"`
 }
 
-// OtelExporter defines the environment variables for configuring the OTLP exporter.
-type OtelExporter struct {
-	// Sets the protocol for all the OTLP endpoints
+// OTelExporter defines the environment variables for configuring the OTLP exporter.
+type OTelExporter struct {
+	// Sets the protocol for both traces and metrics
 	// +optional
-	Protocol string `json:"protocol,omitempty"`
-	// Overrides the protocol for traces
-	// +optional
-	TracesProtocol string `json:"tracesProtocol,omitempty"`
-	// Overrides the protocol for traces
-	// +optional
-	MetricsProtocol string `json:"metricsProtocol,omitempty"`
-	// Sets the OTLP endpoint
-	// +optional
-	OTLPEndpoint string `json:"otlpEndpoint,omitempty"`
-	// Overrides the OTLP endpoint for metrics
-	// +optional
-	MetricsEndpoint string `json:"metricsEndpoint,omitempty"`
+	// +kubebuilder:default=grpc
+	OTLPProtocol string `json:"otlpProtocol,omitempty"`
 	// Overrides the OTLP endpoint for traces
 	// +optional
-	TracesEndpoint string `json:"tracesEndpoint,omitempty"`
-	// Specifies which data types to export
+	OTLPTracesEndpoint string `json:"otlpTracesEndpoint,omitempty"`
+	// Overrides the OTLP endpoint for metrics
 	// +optional
-	OTLPExport string `json:"otlpExport,omitempty"`
-}
-
-type ConditionType string
-
-type Condition struct {
-	Type ConditionType `json:"type" description:"type of condition ie. Available|Progressing|Degraded."`
-
-	Status corev1.ConditionStatus `json:"status" description:"status of the condition, one of True, False, Unknown"`
-
+	OTLPMetricsEndpoint string `json:"otlpMetricsEndpoint,omitempty"`
+	// Specifies whether to enable tracing data export
 	// +optional
-	Reason string `json:"reason,omitempty" description:"one-word CamelCase reason for the condition's last transition"`
-
+	EnableTraces bool `json:"enableTraces,omitempty"`
+	// Specifies whether to enable metrics data export
 	// +optional
-	Message string `json:"message,omitempty" description:"human-readable message indicating details about last transition"`
-
-	// +optional
-	LastTransitionTime metav1.Time `json:"lastTransitionTime" description:"last time the condition transit from one status to another"`
+	EnableMetrics bool `json:"enableMetrics,omitempty"`
 }
 
 type DetectedService struct {
@@ -132,7 +121,7 @@ type GuardrailsOrchestratorStatus struct {
 	Phase string `json:"phase,omitempty"`
 	// Conditions describes the state of the GuardrailsOrchestrator resource.
 	// +optional
-	Conditions []Condition `json:"conditions,omitempty"`
+	Conditions []common.Condition `json:"conditions,omitempty"`
 	// AutoConfigState describes information about the generated autoconfiguration
 	// +optional
 	AutoConfigState *AutoConfigState `json:"autoConfigState,omitempty"`

@@ -54,7 +54,10 @@ endif
 # Image URL to use all building/pushing image targets
 IMG ?= controller:latest
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
-ENVTEST_K8S_VERSION = 1.26.0
+ENVTEST_K8S_VERSION = 1.29.0
+# ENVTEST_VERSION to be set accordingly to go.mod when can be bumped, for now, we use tool version as not sourced from GCS:
+ENVTEST_VERSION ?= release-0.19
+# ENVTEST_VERSION ?= $(shell go list -m -f "{{ .Version }}" sigs.k8s.io/controller-runtime | sed -E 's/v([0-9]+)\.([0-9]+).*/release-\1.\2/')
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -92,7 +95,28 @@ help: ## Display this help.
 
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+	$(CONTROLLER_GEN) rbac:roleName=manager-role,headerFile="hack/boilerplate.yaml.txt" crd:headerFile="hack/boilerplate.yaml.txt" webhook:headerFile="hack/boilerplate.yaml.txt" paths="./..." output:crd:artifacts:config=config/crd/bases
+	@$(MAKE) components-generate
+
+.PHONY: components-generate
+components-generate: ## Generate component kustomizations from controller-gen output
+	@echo "Generating Kustomize components..."
+	@./hack/generate-components.sh
+
+.PHONY: components-validate
+components-validate: kustomize ## Validate all components build correctly
+	@./hack/validate-components.sh
+
+.PHONY: list-overlays
+list-overlays: ## List available overlays
+	@echo "Available overlays:"
+	@echo "  base          - Core operator only (no controllers)"
+	@for overlay in config/overlays/*; do \
+		if [ -d "$$overlay" ]; then \
+			name=$$(basename $$overlay); \
+			echo "  $$name"; \
+		fi \
+	done
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -184,8 +208,8 @@ CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 
 ## Tool Versions
-KUSTOMIZE_VERSION ?= v3.8.7
-CONTROLLER_TOOLS_VERSION ?= v0.16.3
+KUSTOMIZE_VERSION ?= v5.7.0
+CONTROLLER_TOOLS_VERSION ?= v0.20.0
 
 KUSTOMIZE_INSTALL_SCRIPT ?= "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh"
 .PHONY: kustomize
@@ -203,10 +227,18 @@ $(CONTROLLER_GEN): $(LOCALBIN)
 	test -s $(LOCALBIN)/controller-gen && $(LOCALBIN)/controller-gen --version | grep -q $(CONTROLLER_TOOLS_VERSION) || \
 	GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_TOOLS_VERSION)
 
+.PHONY: setup-envtest
+setup-envtest: envtest ## Download the binaries required for ENVTEST in the local bin directory.
+	@echo "Setting up envtest binaries for Kubernetes version $(ENVTEST_K8S_VERSION)..."
+	@$(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path || { \
+		echo "Error: Failed to set up envtest binaries for version $(ENVTEST_K8S_VERSION)."; \
+		exit 1; \
+	}
+
 .PHONY: envtest
-envtest: $(ENVTEST) ## Download envtest-setup locally if necessary.
+envtest: $(ENVTEST) ## Download setup-envtest locally if necessary.
 $(ENVTEST): $(LOCALBIN)
-	test -s $(LOCALBIN)/setup-envtest || GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.0.0-20230216140739-c98506dc3b8e
+	test -s $(LOCALBIN)/setup-envtest || GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(ENVTEST_VERSION)
 
 .PHONY: bundle
 bundle: manifests kustomize ## Generate bundle manifests and metadata, then validate generated files.
@@ -263,3 +295,39 @@ catalog-build: opm ## Build a catalog image.
 .PHONY: catalog-push
 catalog-push: ## Push a catalog image.
 	$(MAKE) docker-push IMG=$(CATALOG_IMG)
+
+# Generate the full set of manifests to deploy the TrustyAI operator, with a customizable deployment namespace and operator image
+OPERATOR_IMAGE ?= quay.io/trustyai/trustyai-service-operator:latest
+.PHONY: manifest-gen
+manifest-gen: kustomize ## Generate deployment manifests. Usage: make manifest-gen NAMESPACE=<namespace> [OVERLAY=<overlay>] [OPERATOR_IMAGE=<image>]
+	@if [ -z "$(NAMESPACE)" ]; then \
+		echo "Error: NAMESPACE argument is required"; \
+		echo ""; \
+		echo "Usage: make manifest-gen NAMESPACE=<namespace> [OVERLAY=<overlay>] [OPERATOR_IMAGE=<image>]"; \
+		echo "Example: make manifest-gen NAMESPACE=my-namespace OVERLAY=odh"; \
+		echo ""; \
+		echo "Available overlays (use 'make list-overlays' for descriptions):"; \
+		echo "  base (default)"; \
+		ls -1 config/overlays/ 2>/dev/null | sed 's/^/  /'; \
+		exit 1; \
+	fi
+	@if [ ! -z "$(OVERLAY)" ] && [ "$(OVERLAY)" != "base" ] && [ ! -d "config/overlays/$(OVERLAY)" ]; then \
+		echo "Error: Overlay '$(OVERLAY)' not found"; \
+		echo "Available overlays:"; \
+		echo "  base"; \
+		ls -1 config/overlays/ 2>/dev/null | sed 's/^/  /' || echo "  (no overlays found)"; \
+		exit 1; \
+	fi
+	@mkdir -p release
+	@if [ -z "$(OVERLAY)" ]; then \
+		echo "Building from config/overlays/testing..."; \
+		$(KUSTOMIZE) build config/overlays/testing | sed "s|namespace: system|namespace: $(NAMESPACE)|g" | sed "s|quay.io/trustyai/trustyai-service-operator:latest|$(OPERATOR_IMAGE)|g" > release/trustyai_bundle.yaml; \
+		echo "✓ Release manifest generated at release/trustyai_bundle.yaml"; \
+	else \
+		echo "Building from config/overlays/$(OVERLAY)..."; \
+		$(KUSTOMIZE) build config/overlays/$(OVERLAY) | sed "s|namespace: system|namespace: $(NAMESPACE)|g" | sed "s|quay.io/trustyai/trustyai-service-operator:latest|$(OPERATOR_IMAGE)|g" > release/trustyai_$(OVERLAY)_bundle.yaml; \
+		echo "✓ Release manifest generated at release/trustyai_$(OVERLAY)_bundle.yaml"; \
+	fi
+	@echo "  Namespace: $(NAMESPACE)"
+	@echo "  Overlay: $(OVERLAY)"
+	@echo "  Image: $(OPERATOR_IMAGE)"
