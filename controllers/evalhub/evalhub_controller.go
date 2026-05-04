@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	evalhubv1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/evalhub/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -25,23 +26,25 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
-func ControllerSetUp(mgr manager.Manager, ns string, recorder record.EventRecorder) error {
+func ControllerSetUp(mgr manager.Manager, ns, operatorConfigMapName string, recorder record.EventRecorder) error {
 	return (&EvalHubReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		restMapper:    mgr.GetRESTMapper(),
-		Namespace:     ns,
-		EventRecorder: recorder,
+		Client:                mgr.GetClient(),
+		Scheme:                mgr.GetScheme(),
+		restMapper:            mgr.GetRESTMapper(),
+		Namespace:             ns,
+		OperatorConfigMapName: operatorConfigMapName,
+		EventRecorder:         recorder,
 	}).SetupWithManager(mgr)
 }
 
 // EvalHubReconciler reconciles an EvalHub object
 type EvalHubReconciler struct {
 	client.Client
-	Scheme        *runtime.Scheme
-	restMapper    meta.RESTMapper
-	Namespace     string
-	EventRecorder record.EventRecorder
+	Scheme                *runtime.Scheme
+	restMapper            meta.RESTMapper
+	Namespace             string
+	OperatorConfigMapName string
+	EventRecorder         record.EventRecorder
 }
 
 //+kubebuilder:rbac:groups=trustyai.opendatahub.io,resources=evalhubs,verbs=get;list;watch;create;update;patch;delete
@@ -55,6 +58,7 @@ type EvalHubReconciler struct {
 //+kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;delete
 //+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=get;list;watch;create;update;delete
+//+kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch;create;update
 //+kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=list;watch;get;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=namespaces,verbs=list;watch
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch;update
@@ -215,6 +219,21 @@ func (r *EvalHubReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return RequeueWithError(err)
 	}
 
+	// Reconcile monitoring resources (ServiceMonitor).
+	// Monitoring failures are non-fatal: log, set a degraded condition, and continue.
+	if r.isServiceMonitorSupported() {
+		if err := r.reconcileServiceMonitor(ctx, instance); err != nil {
+			log.Error(err, "Failed to reconcile ServiceMonitor")
+			instance.SetStatus("MonitoringDegraded", "ServiceMonitorFailed", fmt.Sprintf("Failed to reconcile ServiceMonitor: %v", err), corev1.ConditionTrue)
+			r.Status().Update(ctx, instance)
+		} else {
+			instance.SetStatus("MonitoringDegraded", "MonitoringReady", "", corev1.ConditionFalse)
+			r.Status().Update(ctx, instance)
+		}
+	} else {
+		log.Info("ServiceMonitor CRD not available on this cluster, skipping monitoring reconciliation")
+	}
+
 	// Reconcile Route (if on OpenShift and enabled)
 	if err := r.reconcileRoute(ctx, instance); err != nil {
 		log.Error(err, "Failed to reconcile Route")
@@ -237,20 +256,40 @@ func (r *EvalHubReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return RequeueWithDelay(time.Second * 30)
 }
 
-// SetupWithManager registers the EvalHub CR reconciler and the evaluation Job failure → EvalHub events controller.
-// controller-runtime still runs two controller loops: primary keys are EvalHub vs batch Job (different resource kinds).
+// SetupWithManager registers the EvalHub CR reconciler, the evaluation Job failure → EvalHub events controller,
+// and optionally the evaluation failed Kueue Workload → EvalHub events controller when the cluster serves
+// kueue.x-k8s.io/v1beta1 workloads.
+// It creates and bootstraps a shared evalHubTenantNamespaces cache, then passes it to the auxiliary controllers.
+// controller-runtime runs separate loops for EvalHub, batch Job, and (if installed) kueue Workload.
 func (r *EvalHubReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if err := ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		Named("evalhub").
 		For(&evalhubv1alpha1.EvalHub{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}, builder.OnlyMetadata).
 		Owns(&corev1.ConfigMap{}, builder.OnlyMetadata).
-		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.mapNamespaceToEvalHubs), builder.OnlyMetadata, builder.WithPredicates(tenantLabelPredicate())).
-		Complete(r); err != nil {
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.mapNamespaceToEvalHubs), builder.OnlyMetadata, builder.WithPredicates(tenantLabelPredicate()))
+
+	if r.isServiceMonitorSupported() {
+		b = b.Owns(&monitoringv1.ServiceMonitor{}, builder.OnlyMetadata)
+	}
+
+	if err := b.Complete(r); err != nil {
 		return err
 	}
-	return registerEvalHubEvaluationJobFailureController(mgr)
+	tenantNS := newEvalHubTenantNamespaces()
+	if err := tenantNS.bootstrap(context.Background(), mgr.GetAPIReader()); err != nil {
+		return fmt.Errorf("evalhub: bootstrap tenant namespaces: %w", err)
+	}
+	if err := registerEvalHubEvaluationJobFailureController(mgr, tenantNS); err != nil {
+		return err
+	}
+	if clusterSupportsKueueWorkloads(mgr.GetConfig()) {
+		return registerEvalHubEvaluationFailedKueueWorkloadsReconciler(mgr, tenantNS)
+	}
+	log.Log.Info("Kueue Workload API not available; skipping EvalHub failed Kueue Workloads controller",
+		"groupVersion", "kueue.x-k8s.io/v1beta1", "resource", kueueWorkloadResourceName)
+	return nil
 }
 
 // tenantLabelPredicate returns a predicate that fires only when the tenant label is
