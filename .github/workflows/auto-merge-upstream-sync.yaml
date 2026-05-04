@@ -20,20 +20,21 @@ jobs:
       - name: Approve PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          gh pr review --approve "${{ github.event.pull_request.number }}"
+          gh pr review --approve "$PR_NUMBER"
 
       - name: Enable auto-merge (merge commit)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         # Re-enabling auto-merge is idempotent for the conflict-resolved
         # case (synchronize after auto-merge was cancelled). Swallow the
         # error only when auto-merge is already active; fail loudly
         # otherwise.
         run: |
-          PR="${{ github.event.pull_request.number }}"
-          gh pr merge --auto --merge "$PR" || {
-            STATE=$(gh pr view "$PR" \
+          gh pr merge --auto --merge "$PR_NUMBER" || {
+            STATE=$(gh pr view "$PR_NUMBER" \
               --json autoMergeRequest \
               --jq '.autoMergeRequest.mergeMethod // empty')
             [ -n "$STATE" ] || exit 1
