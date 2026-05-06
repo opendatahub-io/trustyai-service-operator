@@ -84,6 +84,10 @@ func (r *EvalHubReconciler) buildServiceMonitor(instance *evalhubv1alpha1.EvalHu
 	}
 }
 
+// reconcileServiceMonitor ensures a ServiceMonitor exists for the EvalHub instance.
+// The ServiceMonitor spec is fully derived from immutable CR fields (name, namespace),
+// so it is created once and never updated in place. If the CR is deleted, the
+// ServiceMonitor is garbage-collected via its owner reference.
 func (r *EvalHubReconciler) reconcileServiceMonitor(ctx context.Context, instance *evalhubv1alpha1.EvalHub) error {
 	log := log.FromContext(ctx)
 	log.Info("Reconciling ServiceMonitor", "name", serviceMonitorName(instance))
@@ -103,9 +107,5 @@ func (r *EvalHubReconciler) reconcileServiceMonitor(ctx context.Context, instanc
 		return err
 	}
 
-	found.Spec.Endpoints = desired.Spec.Endpoints
-	found.Spec.Selector = desired.Spec.Selector
-	found.Spec.NamespaceSelector = desired.Spec.NamespaceSelector
-	log.Info("Updating ServiceMonitor", "name", found.Name)
-	return r.Update(ctx, found)
+	return nil
 }
