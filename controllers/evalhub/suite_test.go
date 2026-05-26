@@ -130,7 +130,8 @@ func createConfigMap(name, namespace string) *corev1.ConfigMap {
 			Namespace: namespace,
 		},
 		Data: map[string]string{
-			"evalHubImage": "quay.io/ruimvieira/eval-hub:test",
+			"evalHubImage":    "quay.io/ruimvieira/eval-hub:test",
+			"kube-rbac-proxy": "quay.io/openshift/origin-kube-rbac-proxy:4.19",
 		},
 	}
 }
@@ -195,7 +196,7 @@ func setupReconciler(namespace string) (*EvalHubReconciler, context.Context) {
 		EventRecorder:         eventRecorder,
 	}
 
-	// Create the operator image ConfigMap so getEvalHubImage succeeds.
+	// Create the operator image ConfigMap so getImageFromConfigMap succeeds.
 	operatorCM := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      configMapName,

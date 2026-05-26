@@ -221,14 +221,15 @@ func (r *EvalHubReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Reconcile monitoring resources (ServiceMonitor).
 	// Monitoring failures are non-fatal: log, set a degraded condition, and continue.
+	// The condition is set in memory only — updateStatus() at the end of the loop
+	// persists the full status in a single write, avoiding mid-reconcile status
+	// updates that would trigger unnecessary re-reconciles.
 	if r.isServiceMonitorSupported() {
 		if err := r.reconcileServiceMonitor(ctx, instance); err != nil {
 			log.Error(err, "Failed to reconcile ServiceMonitor")
 			instance.SetStatus("MonitoringDegraded", "ServiceMonitorFailed", fmt.Sprintf("Failed to reconcile ServiceMonitor: %v", err), corev1.ConditionTrue)
-			r.Status().Update(ctx, instance)
 		} else {
 			instance.SetStatus("MonitoringDegraded", "MonitoringReady", "", corev1.ConditionFalse)
-			r.Status().Update(ctx, instance)
 		}
 	} else {
 		log.Info("ServiceMonitor CRD not available on this cluster, skipping monitoring reconciliation")
