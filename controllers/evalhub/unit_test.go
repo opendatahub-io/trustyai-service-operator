@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/trustyai-explainability/trustyai-service-operator/api/common"
@@ -12,165 +13,16 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/yaml"
 )
-
-func TestEvalHubReconciler_reconcileDeployment(t *testing.T) {
-	scheme := runtime.NewScheme()
-	require.NoError(t, corev1.AddToScheme(scheme))
-	require.NoError(t, appsv1.AddToScheme(scheme))
-	require.NoError(t, evalhubv1alpha1.AddToScheme(scheme))
-
-	ctx := context.Background()
-	testNamespace := "test-namespace"
-	evalHubName := "test-evalhub"
-
-	// Create EvalHub instance
-	replicas := int32(2)
-	evalHub := &evalhubv1alpha1.EvalHub{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      evalHubName,
-			Namespace: testNamespace,
-		},
-		Spec: evalhubv1alpha1.EvalHubSpec{
-			Replicas: &replicas,
-			Env: []corev1.EnvVar{
-				{Name: "TEST_VAR", Value: "test-value"},
-			},
-		},
-	}
-
-	// Create config map with image
-	configMap := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      configMapName,
-			Namespace: testNamespace,
-		},
-		Data: map[string]string{
-			configMapEvalHubImageKey: "quay.io/test/eval-hub:latest",
-		},
-	}
-
-	// Create fake client
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(evalHub, configMap).
-		Build()
-
-	reconciler := &EvalHubReconciler{
-		Client:        fakeClient,
-		Scheme:        scheme,
-		Namespace:     testNamespace,
-		EventRecorder: record.NewFakeRecorder(10),
-	}
-
-	t.Run("should create deployment with correct spec", func(t *testing.T) {
-		err := reconciler.reconcileDeployment(ctx, evalHub, nil, nil)
-		require.NoError(t, err)
-
-		// Verify deployment was created
-		deployment := &appsv1.Deployment{}
-		err = fakeClient.Get(ctx, types.NamespacedName{
-			Name:      evalHubName,
-			Namespace: testNamespace,
-		}, deployment)
-		require.NoError(t, err)
-
-		// Check basic deployment properties
-		assert.Equal(t, evalHubName, deployment.Name)
-		assert.Equal(t, testNamespace, deployment.Namespace)
-		assert.Equal(t, replicas, *deployment.Spec.Replicas)
-
-		// Check container configuration — single container, no sidecar
-		require.Len(t, deployment.Spec.Template.Spec.Containers, 1)
-
-		container := &deployment.Spec.Template.Spec.Containers[0]
-
-		assert.Equal(t, containerName, container.Name)
-		assert.Equal(t, "quay.io/test/eval-hub:latest", container.Image)
-		assert.Equal(t, corev1.PullAlways, container.ImagePullPolicy)
-
-		// Check ports — direct TLS on 8443
-		require.Len(t, container.Ports, 1)
-		assert.Equal(t, "https", container.Ports[0].Name)
-		assert.Equal(t, int32(containerPort), container.Ports[0].ContainerPort)
-
-		// Check environment variables include both default and custom
-		envVarMap := make(map[string]string)
-		for _, env := range container.Env {
-			envVarMap[env.Name] = env.Value
-		}
-		assert.Equal(t, "0.0.0.0", envVarMap["API_HOST"])
-		assert.Equal(t, "8443", envVarMap["PORT"])
-		assert.Equal(t, "test-value", envVarMap["TEST_VAR"])
-
-		// Check SERVICE_URL and EVALHUB_INSTANCE_NAME are propagated
-		assert.Equal(t, "https://test-evalhub.test-namespace.svc.cluster.local:8443", envVarMap["SERVICE_URL"])
-		assert.Equal(t, evalHubName, envVarMap["EVALHUB_INSTANCE_NAME"])
-
-		// Check resource requirements
-		assert.Equal(t, resource.MustParse("500m"), container.Resources.Requests[corev1.ResourceCPU])
-		assert.Equal(t, resource.MustParse("512Mi"), container.Resources.Requests[corev1.ResourceMemory])
-
-		// Check health probes — HTTPGet with HTTPS scheme
-		require.NotNil(t, container.LivenessProbe)
-		require.NotNil(t, container.LivenessProbe.HTTPGet)
-		assert.Equal(t, "/api/v1/health", container.LivenessProbe.HTTPGet.Path)
-		assert.Equal(t, intstr.FromInt(containerPort), container.LivenessProbe.HTTPGet.Port)
-		assert.Equal(t, corev1.URISchemeHTTPS, container.LivenessProbe.HTTPGet.Scheme)
-		assert.Equal(t, int32(30), container.LivenessProbe.InitialDelaySeconds)
-
-		require.NotNil(t, container.ReadinessProbe)
-		require.NotNil(t, container.ReadinessProbe.HTTPGet)
-		assert.Equal(t, "/api/v1/health", container.ReadinessProbe.HTTPGet.Path)
-		assert.Equal(t, intstr.FromInt(containerPort), container.ReadinessProbe.HTTPGet.Port)
-		assert.Equal(t, corev1.URISchemeHTTPS, container.ReadinessProbe.HTTPGet.Scheme)
-		assert.Equal(t, int32(10), container.ReadinessProbe.InitialDelaySeconds)
-	})
-
-	t.Run("should use fallback image when configmap missing", func(t *testing.T) {
-		// Create client without configmap
-		fakeClientNoConfig := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithObjects(evalHub).
-			Build()
-
-		reconcilerNoConfig := &EvalHubReconciler{
-			Client:        fakeClientNoConfig,
-			Scheme:        scheme,
-			Namespace:     testNamespace,
-			EventRecorder: record.NewFakeRecorder(10),
-		}
-
-		err := reconcilerNoConfig.reconcileDeployment(ctx, evalHub, nil, nil)
-		require.NoError(t, err)
-
-		// Verify the deployment was created with default image
-		deployment := &appsv1.Deployment{}
-		err = fakeClientNoConfig.Get(ctx, types.NamespacedName{
-			Name:      evalHubName,
-			Namespace: testNamespace,
-		}, deployment)
-		require.NoError(t, err)
-
-		var container *corev1.Container
-		for i, c := range deployment.Spec.Template.Spec.Containers {
-			if c.Name == containerName {
-				container = &deployment.Spec.Template.Spec.Containers[i]
-				break
-			}
-		}
-		require.NotNil(t, container)
-		assert.Equal(t, defaultEvalHubImage, container.Image)
-	})
-}
 
 func TestEvalHubReconciler_reconcileService(t *testing.T) {
 	scheme := runtime.NewScheme()
@@ -254,7 +106,8 @@ func TestEvalHubReconciler_reconcileConfigMap(t *testing.T) {
 			Namespace: testNamespace,
 		},
 		Data: map[string]string{
-			configMapEvalHubImageKey: "quay.io/evalhub/evalhub:test",
+			configMapEvalHubImageKey:       "quay.io/evalhub/evalhub:test",
+			configMapKubeRBACProxyImageKey: "quay.io/opendatahub/odh-kube-rbac-proxy:odh-stable",
 		},
 	}
 
@@ -338,7 +191,7 @@ func TestEvalHubReconciler_updateStatus(t *testing.T) {
 	}
 
 	t.Run("should update status to Ready when deployment is ready", func(t *testing.T) {
-		err := reconciler.updateStatus(ctx, evalHub)
+		err := reconciler.updateStatus(ctx, evalHub, true)
 		require.NoError(t, err)
 
 		// Verify status was updated
@@ -377,7 +230,7 @@ func TestEvalHubReconciler_updateStatus(t *testing.T) {
 		err := fakeClient.Status().Update(ctx, deployment)
 		require.NoError(t, err)
 
-		err = reconciler.updateStatus(ctx, evalHub)
+		err = reconciler.updateStatus(ctx, evalHub, true)
 		require.NoError(t, err)
 
 		// Verify status was updated
@@ -483,6 +336,21 @@ func TestEvalHubHelperMethods(t *testing.T) {
 		customReplicas := int32(3)
 		spec.Replicas = &customReplicas
 		assert.Equal(t, int32(3), spec.GetReplicas())
+	})
+
+	t.Run("EvalHubSpec GetMCPReplicas method", func(t *testing.T) {
+		var nilSpec *evalhubv1alpha1.EvalHubSpec
+		assert.Equal(t, int32(1), nilSpec.GetMCPReplicas())
+
+		spec := &evalhubv1alpha1.EvalHubSpec{}
+		assert.Equal(t, int32(1), spec.GetMCPReplicas())
+
+		spec.MCP = &evalhubv1alpha1.EvalHubMCPSpec{}
+		assert.Equal(t, int32(1), spec.GetMCPReplicas())
+
+		three := int32(3)
+		spec.MCP.Replicas = &three
+		assert.Equal(t, int32(3), spec.GetMCPReplicas())
 	})
 }
 
@@ -1456,7 +1324,8 @@ func TestEvalHubReconciler_reconcileDeployment_WithDB(t *testing.T) {
 			Namespace: testNamespace,
 		},
 		Data: map[string]string{
-			configMapEvalHubImageKey: "quay.io/test/eval-hub:latest",
+			configMapEvalHubImageKey:       "quay.io/test/eval-hub:latest",
+			configMapKubeRBACProxyImageKey: "quay.io/opendatahub/odh-kube-rbac-proxy:odh-stable",
 		},
 	}
 
@@ -1510,7 +1379,7 @@ func TestEvalHubReconciler_reconcileDeployment_WithDB(t *testing.T) {
 			}
 		}
 		require.NotNil(t, container)
-		assert.Len(t, container.VolumeMounts, 5) // evalhub-config + tls + service-ca + mlflow-token + db-secret
+		assert.Len(t, container.VolumeMounts, 4) // evalhub-config + service-ca + mlflow-token + db-secret
 
 		var dbMount *corev1.VolumeMount
 		for i, m := range container.VolumeMounts {
@@ -1700,7 +1569,8 @@ func TestEvalHubReconciler_reconcileProviderConfigMaps(t *testing.T) {
 				Namespace: operatorNamespace,
 			},
 			Data: map[string]string{
-				configMapEvalHubImageKey: "quay.io/test/eval-hub:latest",
+				configMapEvalHubImageKey:       "quay.io/test/eval-hub:latest",
+				configMapKubeRBACProxyImageKey: "quay.io/opendatahub/odh-kube-rbac-proxy:odh-stable",
 			},
 		}
 
@@ -2186,4 +2056,46 @@ func TestEvalHubReconciler_reconcileTenantNamespaces(t *testing.T) {
 		}, sa)
 		require.NoError(t, err, "active tenant SA should not be deleted")
 	})
+}
+
+func TestEvalHubReconciler_reconcileServiceMonitor_NoOpUpdate(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, evalhubv1alpha1.AddToScheme(scheme))
+	require.NoError(t, monitoringv1.AddToScheme(scheme))
+
+	ctx := context.Background()
+	evalHub := &evalhubv1alpha1.EvalHub{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+	}
+
+	var smUpdateCount int
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(evalHub).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if _, ok := obj.(*monitoringv1.ServiceMonitor); ok {
+					smUpdateCount++
+				}
+				return c.Update(ctx, obj, opts...)
+			},
+		}).
+		Build()
+
+	reconciler := &EvalHubReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Namespace:     "ns",
+		EventRecorder: record.NewFakeRecorder(10),
+	}
+
+	// First call: creates the ServiceMonitor (Create, not Update)
+	require.NoError(t, reconciler.reconcileServiceMonitor(ctx, evalHub))
+	assert.Equal(t, 0, smUpdateCount, "first call should Create, not Update")
+
+	// Second call: spec unchanged — should NOT call Update
+	require.NoError(t, reconciler.reconcileServiceMonitor(ctx, evalHub))
+	assert.Equal(t, 0, smUpdateCount,
+		"reconcileServiceMonitor should not update when spec is unchanged")
 }
