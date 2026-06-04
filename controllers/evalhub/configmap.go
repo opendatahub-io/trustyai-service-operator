@@ -22,6 +22,7 @@ import (
 type ServiceConfig struct {
 	Port             int    `json:"port"`
 	Host             string `json:"host,omitempty"`
+	DisableAuth      bool   `json:"disable_auth,omitempty"`
 	ReadyFile        string `json:"ready_file"`
 	TerminationFile  string `json:"termination_file"`
 	EvalInitImage    string `json:"eval_init_image,omitempty"`
@@ -153,7 +154,8 @@ func (r *EvalHubReconciler) generateConfigData(ctx context.Context, instance *ev
 
 	config := EvalHubConfig{
 		Service: ServiceConfig{
-			Port:             containerPort,
+			Port:             evalHubAppPort,
+			DisableAuth:      true,
 			ReadyFile:        "/tmp/repo-ready",
 			TerminationFile:  "/tmp/termination-log",
 			EvalInitImage:    evalHubImage,
@@ -162,6 +164,7 @@ func (r *EvalHubReconciler) generateConfigData(ctx context.Context, instance *ev
 		EnvMappings: EnvMappings{
 			"PORT":                        "service.port",
 			"API_HOST":                    "service.host",
+			"DISABLE_AUTH":                "service.disable_auth",
 			"TLS_CERT_FILE":               "service.tls_cert_file",
 			"TLS_KEY_FILE":                "service.tls_key_file",
 			"DB_URL":                      "database.url",
@@ -301,7 +304,8 @@ func generateAuthConfigData() string {
                 apiGroup: mlflow.kubeflow.org
                 resource: experiments
                 verb: get
-        - resources:
+        - methods: [get, delete, put, patch]
+          resources:
             - rewrites:
                 byHttpHeader:
                   name: X-Tenant
@@ -312,7 +316,8 @@ func generateAuthConfigData() string {
                 verb: "{{.FromMethod}}"
     - path: /api/v1/evaluations/collections
       mappings:
-        - resources:
+        - methods: [get, post, delete, put, patch]
+          resources:
             - rewrites:
                 byHttpHeader:
                   name: X-Tenant
@@ -323,7 +328,8 @@ func generateAuthConfigData() string {
                 verb: "{{.FromMethod}}"
     - path: /api/v1/evaluations/providers
       mappings:
-        - resources:
+        - methods: [get, post, delete, put, patch]
+          resources:
             - rewrites:
                 byHttpHeader:
                   name: X-Tenant
@@ -348,7 +354,7 @@ func (r *EvalHubReconciler) getImageFromConfigMap(ctx context.Context, key strin
 	// Define the key for the ConfigMap
 	configMapKey := types.NamespacedName{
 		Namespace: r.Namespace,
-		Name:      configMapName,
+		Name:      r.effectiveOperatorConfigMapName(),
 	}
 
 	// Create an empty ConfigMap object
@@ -360,11 +366,10 @@ func (r *EvalHubReconciler) getImageFromConfigMap(ctx context.Context, key strin
 		if errors.IsNotFound(err) {
 			// ConfigMap not found - FAIL deployment with clear error
 			return "", fmt.Errorf("required configmap '%s' not found in namespace '%s' - operator configuration missing",
-				configMapName, r.Namespace)
+				configMapKey.Name, r.Namespace)
 		}
-		// Other error occurred when trying to fetch the ConfigMap
 		return "", fmt.Errorf("error reading configmap '%s' in namespace '%s': %w",
-			configMapName, r.Namespace, err)
+			configMapKey.Name, r.Namespace, err)
 	}
 
 	log.V(1).Info("Found ConfigMap", "configmap", configMapKey)
