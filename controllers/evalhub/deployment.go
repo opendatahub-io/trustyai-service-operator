@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	evalhubv1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/evalhub/v1alpha1"
+	evalhubv1 "github.com/trustyai-explainability/trustyai-service-operator/api/evalhub/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -16,7 +16,7 @@ import (
 )
 
 // reconcileDeployment creates or updates the Deployment for EvalHub
-func (r *EvalHubReconciler) reconcileDeployment(ctx context.Context, instance *evalhubv1alpha1.EvalHub, providerCMNames []string, collectionCMNames []string) error {
+func (r *EvalHubReconciler) reconcileDeployment(ctx context.Context, instance *evalhubv1.EvalHub, providerCMNames []string, collectionCMNames []string) error {
 	log := log.FromContext(ctx)
 	log.Info("Reconciling Deployment", "name", instance.Name)
 
@@ -59,7 +59,7 @@ func (r *EvalHubReconciler) reconcileDeployment(ctx context.Context, instance *e
 }
 
 // buildDeploymentSpec builds the deployment specification for EvalHub
-func (r *EvalHubReconciler) buildDeploymentSpec(ctx context.Context, instance *evalhubv1alpha1.EvalHub, providerCMNames []string, collectionCMNames []string) (appsv1.DeploymentSpec, error) {
+func (r *EvalHubReconciler) buildDeploymentSpec(ctx context.Context, instance *evalhubv1.EvalHub, providerCMNames []string, collectionCMNames []string) (appsv1.DeploymentSpec, error) {
 	labels := map[string]string{
 		"app":       "eval-hub",
 		"instance":  instance.Name,
@@ -131,11 +131,20 @@ func (r *EvalHubReconciler) buildDeploymentSpec(ctx context.Context, instance *e
 			Name:  "MLFLOW_TOKEN_PATH",
 			Value: mlflowTokenMountPath + "/" + mlflowTokenFile,
 		},
+		{
+			Name:  "METRICS_PORT",
+			Value: fmt.Sprintf("%d", metricsPort),
+		},
+		{
+			Name:  "METRICS_HOST",
+			Value: "0.0.0.0",
+		},
 	}
 
 	// Merge environment variables with CR values taking precedence.
 	// API_HOST and PORT are fixed for the loopback HTTP listener; TLS is terminated by kube-rbac-proxy only.
-	env := mergeEnvVars(defaultEnvVars, instance.Spec.Env, "API_HOST", "PORT", "TLS_CERT_FILE", "TLS_KEY_FILE")
+	// METRICS_PORT and METRICS_HOST are fixed for the dedicated Prometheus metrics server.
+	env := mergeEnvVars(defaultEnvVars, instance.Spec.Env, "API_HOST", "PORT", "TLS_CERT_FILE", "TLS_KEY_FILE", "METRICS_PORT", "METRICS_HOST")
 
 	// Build volume mounts for the evalhub container
 	volumeMounts := []corev1.VolumeMount{
@@ -185,6 +194,11 @@ func (r *EvalHubReconciler) buildDeploymentSpec(ctx context.Context, instance *e
 			{
 				Name:          "evalhub",
 				ContainerPort: evalHubAppPort,
+				Protocol:      corev1.ProtocolTCP,
+			},
+			{
+				Name:          "metrics",
+				ContainerPort: metricsPort,
 				Protocol:      corev1.ProtocolTCP,
 			},
 		},
