@@ -25,6 +25,9 @@ const (
 
 	// Service configuration (public HTTPS targets kube-rbac-proxy on this port)
 	servicePort = 8443
+	// metricsPort is the dedicated Prometheus metrics port on the EvalHub container.
+	// Bound to 0.0.0.0, serves /metrics over plain HTTP with no auth (cluster-internal only).
+	metricsPort = 9090
 
 	// kube-rbac-proxy sidecar
 	kubeRBACProxyContainerName       = "kube-rbac-proxy"
@@ -97,6 +100,12 @@ const (
 	mcpConfigFileName      = "config.yaml"
 	mcpServiceCAVolumeName = "mcp-service-ca"
 	mcpServiceCAMountPath  = "/etc/evalhub-mcp/ca"
+
+	// Discovery ConfigMap injected into every tenant namespace for EvalHub service URL resolution.
+	// A single well-known CM is shared across all EvalHub instances; each instance owns one
+	// key of the form "{instanceName}.url" so multiple EvalHub instances can coexist.
+	discoveryConfigMapName  = "evalhub-discovery"
+	discoveryConfigMapLabel = "evalhub.trustyai.opendatahub.io/discovery"
 
 	// Collection ConfigMap configuration
 	collectionLabel       = "trustyai.opendatahub.io/evalhub-collection-type"
