@@ -46,6 +46,9 @@ allowed_api_resources := {
 	["rbac.authorization.k8s.io", "roles"],
 	["rbac.authorization.k8s.io", "rolebindings"],
 
+	# --- openshift config ---
+	["config.openshift.io", "apiservers"],
+
 	# --- networking / routes ---
 	["networking.istio.io", "destinationrules"],
 	["networking.istio.io", "virtualservices"],
