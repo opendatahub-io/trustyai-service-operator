@@ -9,9 +9,6 @@ const (
 	// Service name for registration
 	ServiceName = "EVALHUB"
 
-	// Default image configuration
-	defaultEvalHubImage = "quay.io/evalhub/evalhub:latest"
-
 	// Container configuration
 	containerName = "evalhub"
 	// evalHubAppPort is the eval-hub container listen port on loopback (API_HOST=127.0.0.1, PORT in deployment env).
@@ -114,6 +111,27 @@ const (
 	collectionNameLabel   = "trustyai.opendatahub.io/evalhub-collection-name"
 	collectionsVolumeName = "evalhub-collections"
 	collectionsMountPath  = configDirPath + "/collections"
+
+	// Tenancy
+	invalidPlacementReason = "InvalidPlacement"
+
+	// Single-tenancy convenience Role names (namespace-scoped, created in instance namespace)
+	tenantAdminRoleName    = "evalhub-tenant-admin"
+	tenantUserRoleName     = "evalhub-user"
+	tenantAdminBindingName = "evalhub-tenant-admin-binding"
+
+	// Tenant ConfigMap label value distinguishing instance-namespace ConfigMaps from system (operator-namespace) ones.
+	providerTenantValue   = "tenant"
+	collectionTenantValue = "tenant"
+	providerSystemValue   = "system"
+	collectionSystemValue = "system"
+
+	// Tenant provider/collection ConfigMap volume and mount path configuration.
+	// Tenant CMs are mounted at a separate /tenant/ sub-path so they cannot shadow system configs.
+	providersTenantVolumeName   = "evalhub-providers-tenant"
+	providersTenantMountPath    = configDirPath + "/providers/tenant"
+	collectionsTenantVolumeName = "evalhub-collections-tenant"
+	collectionsTenantMountPath  = configDirPath + "/collections/tenant"
 )
 
 var (

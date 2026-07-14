@@ -26,6 +26,16 @@ const (
 func (r *EvalHubReconciler) reconcileTenantNamespaces(ctx context.Context, instance *evalhubv1.EvalHub) error {
 	log := log.FromContext(ctx)
 
+	// Single-tenant instances serve only their own namespace — skip cross-namespace provisioning
+	// and clean up any stale resources left over from a previous multi→single mode switch.
+	if instance.Spec.IsSingleTenancy() {
+		log.Info("Single-tenant mode: skipping cross-namespace tenant provisioning")
+		if err := r.cleanupStaleTenantResources(ctx, instance, map[string]bool{}); err != nil {
+			return err
+		}
+		return r.cleanupDiscoveryConfigMaps(ctx, instance, map[string]bool{})
+	}
+
 	// List namespaces with the tenant label
 	nsList := &corev1.NamespaceList{}
 	if err := r.List(ctx, nsList, client.HasLabels{tenantLabel}); err != nil {
@@ -35,7 +45,12 @@ func (r *EvalHubReconciler) reconcileTenantNamespaces(ctx context.Context, insta
 	// Build set of active tenant namespaces for the cleanup pass
 	activeTenants := make(map[string]bool, len(nsList.Items))
 	for i := range nsList.Items {
-		activeTenants[nsList.Items[i].Name] = true
+		ns := &nsList.Items[i]
+		if ns.DeletionTimestamp != nil {
+			log.Info("Skipping terminating tenant namespace", "namespace", ns.Name)
+			continue
+		}
+		activeTenants[ns.Name] = true
 	}
 
 	for ns := range activeTenants {
@@ -87,6 +102,21 @@ func (r *EvalHubReconciler) reconcileTenantNamespaces(ctx context.Context, insta
 			APIGroup: rbacv1.GroupName,
 		}, instance.Namespace); err != nil {
 			log.Error(err, "Failed to create hardware-profiles-reader RoleBinding in tenant namespace", "namespace", ns)
+			return err
+		}
+
+		// Create pod-logs Role and RoleBinding so the EvalHub service SA can read job pod logs.
+		if err := r.createServicePodLogsRole(ctx, instance, ns); err != nil {
+			log.Error(err, "Failed to create service pod-logs Role in tenant namespace", "namespace", ns)
+			return err
+		}
+		podLogsRBName := normalizeDNS1123LabelValue(instance.Name + "-" + instance.Namespace + "-" + ns + "-service-pod-logs-rb")
+		if err := r.createJobRoleBinding(ctx, instance, podLogsRBName, serviceAccountName, ns, rbacv1.RoleRef{
+			Kind:     "Role",
+			Name:     generateServicePodLogsRoleName(instance),
+			APIGroup: rbacv1.GroupName,
+		}, instance.Namespace); err != nil {
+			log.Error(err, "Failed to create service pod-logs RoleBinding in tenant namespace", "namespace", ns)
 			return err
 		}
 
