@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
+	"github.com/trustyai-explainability/trustyai-service-operator/pkg/configmap"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -26,18 +24,18 @@ const (
 	NemoGuardrailsImageKey            = "nemo-guardrails-image"
 )
 
-// Environment variable names following RELATED_IMAGE_ODH_* convention
+// Operand image env vars injected by the ODH platform operator at deploy time
 const (
-	RelatedImageTrustyAIService          = "RELATED_IMAGE_ODH_TRUSTYAI_SERVICE_IMAGE"
-	RelatedImageEvalHub                  = "RELATED_IMAGE_ODH_EVAL_HUB_IMAGE"
-	RelatedImageKubeRBACProxy            = "RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE"
-	RelatedImageLMESJob                  = "RELATED_IMAGE_ODH_TA_LMES_JOB_IMAGE"
-	RelatedImageLMESDriver               = "RELATED_IMAGE_ODH_TA_LMES_DRIVER_IMAGE"
-	RelatedImageGuardrailsOrchestrator   = "RELATED_IMAGE_ODH_FMS_GUARDRAILS_ORCHESTRATOR_IMAGE"
-	RelatedImageBuiltInDetector          = "RELATED_IMAGE_ODH_BUILT_IN_DETECTOR_IMAGE"
-	RelatedImageVLLMOrchestratorGateway  = "RELATED_IMAGE_ODH_TRUSTYAI_VLLM_ORCHESTRATOR_GATEWAY_IMAGE"
-	RelatedImageGarakLLSProviderDSP      = "RELATED_IMAGE_ODH_TRUSTYAI_GARAK_LLS_PROVIDER_DSP_IMAGE"
-	RelatedImageNemoGuardrailsServer     = "RELATED_IMAGE_ODH_TRUSTYAI_NEMO_GUARDRAILS_SERVER_IMAGE"
+	RelatedImageTrustyAIService         = "RELATED_IMAGE_ODH_TRUSTYAI_SERVICE_IMAGE"
+	RelatedImageEvalHub                 = "RELATED_IMAGE_ODH_EVAL_HUB_IMAGE"
+	RelatedImageKubeRBACProxy           = "RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE"
+	RelatedImageLMESJob                 = "RELATED_IMAGE_ODH_TA_LMES_JOB_IMAGE"
+	RelatedImageLMESDriver              = "RELATED_IMAGE_ODH_TA_LMES_DRIVER_IMAGE"
+	RelatedImageGuardrailsOrchestrator  = "RELATED_IMAGE_ODH_FMS_GUARDRAILS_ORCHESTRATOR_IMAGE"
+	RelatedImageBuiltInDetector         = "RELATED_IMAGE_ODH_BUILT_IN_DETECTOR_IMAGE"
+	RelatedImageVLLMOrchestratorGateway = "RELATED_IMAGE_ODH_TRUSTYAI_VLLM_ORCHESTRATOR_GATEWAY_IMAGE"
+	RelatedImageGarakLLSProviderDSP     = "RELATED_IMAGE_ODH_TRUSTYAI_GARAK_LLS_PROVIDER_DSP_IMAGE"
+	RelatedImageNemoGuardrailsServer    = "RELATED_IMAGE_ODH_TRUSTYAI_NEMO_GUARDRAILS_SERVER_IMAGE"
 )
 
 // imageMapping maps ConfigMap keys to their corresponding RELATED_IMAGE_* environment variable names
@@ -74,7 +72,7 @@ func GetImageFromConfigMapWithFallback(ctx context.Context, c client.Client, con
 }
 
 // ResolveImage resolves an operand image URL by checking in this order:
-//  1. RELATED_IMAGE_ODH_* environment variable (if configMapKey is recognized)
+//  1. Injected env var for the image key (if configMapKey is recognized)
 //  2. ConfigMap value at configMapKey
 //  3. fallbackValue (if provided and non-empty)
 //
@@ -113,20 +111,12 @@ func ResolveImage(ctx context.Context, c client.Client, configMapKey, configMapN
 // getImageFromConfigMapDirect is an internal helper that directly reads from ConfigMap without env var check.
 // This is used internally by ResolveImage to avoid circular logic.
 func getImageFromConfigMapDirect(ctx context.Context, c client.Client, configMapKey, configMapName, namespace string) (string, error) {
-	// Inline implementation to avoid circular import with controllers/utils.
-	// TODO: Refactor to shared pkg/configmap package to eliminate duplication.
-	// See https://github.com/trustyai-explainability/trustyai-service-operator/issues/783
-
-	configMap := &corev1.ConfigMap{}
-	err := c.Get(ctx, types.NamespacedName{Name: configMapName, Namespace: namespace}, configMap)
+	cm, err := configmap.Get(ctx, c, configMapName, namespace)
 	if err != nil {
-		if errors.IsNotFound(err) {
-			return "", fmt.Errorf("configmap %s not found in namespace %s", configMapName, namespace)
-		}
-		return "", fmt.Errorf("error reading configmap %s in namespace %s: %w", configMapName, namespace, err)
+		return "", err
 	}
 
-	value, ok := configMap.Data[configMapKey]
+	value, ok := cm.Data[configMapKey]
 	if !ok {
 		return "", fmt.Errorf("configmap %s in namespace %s does not contain key %s", configMapName, namespace, configMapKey)
 	}
