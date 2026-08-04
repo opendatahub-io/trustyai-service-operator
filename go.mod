@@ -1,6 +1,6 @@
 module github.com/trustyai-explainability/trustyai-service-operator
 
-go 1.23.0
+go 1.25
 
 require (
 	github.com/kserve/kserve v0.12.1
@@ -122,7 +122,7 @@ require (
 	k8s.io/component-base v0.29.1 // indirect
 	k8s.io/klog/v2 v2.110.1 // indirect
 	k8s.io/kube-openapi v0.0.0-20231113174909-778a5567bc1e // indirect
-	k8s.io/utils v0.0.0-20230726121419-3b25d923346b
+	k8s.io/utils v0.0.0-20260707023825-cf1189d6abe3
 	knative.dev/networking v0.0.0-20231115015815-3af9769712cd // indirect
 	knative.dev/pkg v0.0.0-20231115001034-97c7258e3a98
 	knative.dev/serving v0.39.3 // indirect
