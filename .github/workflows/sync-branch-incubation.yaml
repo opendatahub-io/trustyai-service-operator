@@ -1,8 +1,9 @@
-name: Sync branch incubation
+# DEPRECATED: main is now synced directly to stable by
+# sync-branch-stable.yaml. The automatic `push: main` trigger has been
+# removed; this workflow only runs when dispatched manually.
+name: Sync branch incubation (deprecated)
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 jobs:
   sync-branches:
