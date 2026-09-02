@@ -5,6 +5,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// TrustyAIInstanceName is the only metadata.name accepted for a TrustyAI
+// resource, enforced by the CEL validation on the TrustyAI type below.
+const TrustyAIInstanceName = "default-trustyai"
+
 // EnabledServices defines which TrustyAI services are enabled
 type EnabledServices struct {
 	// +optional
@@ -63,7 +67,7 @@ type TrustyAIStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=tai
 // +kubebuilder:storageversion
-// +kubebuilder:validation:XValidation:rule="self.metadata.name == 'default'",message="TrustyAI resource must be named 'default'"
+// +kubebuilder:validation:XValidation:rule="self.metadata.name == 'default-trustyai'",message="TrustyAI resource must be named 'default-trustyai'"
 // +kubebuilder:printcolumn:name="Management State",type=string,JSONPath=`.spec.managementState`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
