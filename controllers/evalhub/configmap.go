@@ -538,6 +538,11 @@ func (r *EvalHubReconciler) validateImageConfiguration(ctx context.Context, imag
 //   - trustyai.opendatahub.io/evalhub-provider-type=system
 //   - trustyai.opendatahub.io/evalhub-provider-name=<name>
 //
+// In single-tenancy mode, if a system provider is not found in the operator namespace,
+// the reconciler falls back to searching for a tenant-labeled provider in the instance
+// namespace. This keeps system providers sourced from the trusted operator namespace
+// while allowing single-tenancy users to define providers in their own namespace.
+//
 // Returns the list of created ConfigMap names (for building projected volumes).
 func (r *EvalHubReconciler) reconcileProviderConfigMaps(ctx context.Context, instance *evalhubv1.EvalHub) ([]string, error) {
 	if len(instance.Spec.Providers) == 0 {
@@ -547,26 +552,33 @@ func (r *EvalHubReconciler) reconcileProviderConfigMaps(ctx context.Context, ins
 	log := log.FromContext(ctx)
 	log.Info("Reconciling Provider ConfigMaps", "instance", instance.Name, "providers", instance.Spec.Providers)
 
-	sourceNamespace := r.Namespace
-	if instance.Spec.IsSingleTenancy() {
-		sourceNamespace = instance.Namespace
-	}
-
 	var cmNames []string
 	for _, providerName := range instance.Spec.Providers {
-		// Look up the source ConfigMap by both labels
+		// Look up the source ConfigMap by both labels in the operator namespace
 		var sourceList corev1.ConfigMapList
 		if err := r.List(ctx, &sourceList,
-			client.InNamespace(sourceNamespace),
+			client.InNamespace(r.Namespace),
 			client.MatchingLabels{
 				providerLabel:     "system",
 				providerNameLabel: providerName,
 			}); err != nil {
-			return nil, fmt.Errorf("failed to list provider ConfigMaps for %q in namespace %s: %w", providerName, sourceNamespace, err)
+			return nil, fmt.Errorf("failed to list provider ConfigMaps for %q in namespace %s: %w", providerName, r.Namespace, err)
 		}
+
+		if len(sourceList.Items) == 0 && instance.Spec.IsSingleTenancy() {
+			if err := r.List(ctx, &sourceList,
+				client.InNamespace(instance.Namespace),
+				client.MatchingLabels{
+					providerLabel:     providerTenantValue,
+					providerNameLabel: providerName,
+				}); err != nil {
+				return nil, fmt.Errorf("failed to list tenant provider ConfigMaps for %q in namespace %s: %w", providerName, instance.Namespace, err)
+			}
+		}
+
 		if len(sourceList.Items) == 0 {
 			return nil, fmt.Errorf("provider %q not found: no ConfigMap with label %s=%s in namespace %s",
-				providerName, providerNameLabel, providerName, sourceNamespace)
+				providerName, providerNameLabel, providerName, r.Namespace)
 		}
 
 		src := &sourceList.Items[0]
@@ -616,6 +628,10 @@ func (r *EvalHubReconciler) reconcileProviderConfigMaps(ctx context.Context, ins
 //   - trustyai.opendatahub.io/evalhub-collection-type=system
 //   - trustyai.opendatahub.io/evalhub-collection-name=<name>
 //
+// In single-tenancy mode, if a system collection is not found in the operator namespace,
+// the reconciler falls back to searching for a tenant-labeled collection in the instance
+// namespace.
+//
 // Returns the list of created ConfigMap names (for building projected volumes).
 func (r *EvalHubReconciler) reconcileCollectionConfigMaps(ctx context.Context, instance *evalhubv1.EvalHub) ([]string, error) {
 	if len(instance.Spec.Collections) == 0 {
@@ -625,26 +641,33 @@ func (r *EvalHubReconciler) reconcileCollectionConfigMaps(ctx context.Context, i
 	log := log.FromContext(ctx)
 	log.Info("Reconciling Collection ConfigMaps", "instance", instance.Name, "collections", instance.Spec.Collections)
 
-	sourceNamespace := r.Namespace
-	if instance.Spec.IsSingleTenancy() {
-		sourceNamespace = instance.Namespace
-	}
-
 	var cmNames []string
 	for _, collectionName := range instance.Spec.Collections {
-		// Look up the source ConfigMap by both labels
+		// Look up the source ConfigMap by both labels in the operator namespace
 		var sourceList corev1.ConfigMapList
 		if err := r.List(ctx, &sourceList,
-			client.InNamespace(sourceNamespace),
+			client.InNamespace(r.Namespace),
 			client.MatchingLabels{
 				collectionLabel:     "system",
 				collectionNameLabel: collectionName,
 			}); err != nil {
-			return nil, fmt.Errorf("failed to list collection ConfigMaps for %q in namespace %s: %w", collectionName, sourceNamespace, err)
+			return nil, fmt.Errorf("failed to list collection ConfigMaps for %q in namespace %s: %w", collectionName, r.Namespace, err)
 		}
+
+		if len(sourceList.Items) == 0 && instance.Spec.IsSingleTenancy() {
+			if err := r.List(ctx, &sourceList,
+				client.InNamespace(instance.Namespace),
+				client.MatchingLabels{
+					collectionLabel:     collectionTenantValue,
+					collectionNameLabel: collectionName,
+				}); err != nil {
+				return nil, fmt.Errorf("failed to list tenant collection ConfigMaps for %q in namespace %s: %w", collectionName, instance.Namespace, err)
+			}
+		}
+
 		if len(sourceList.Items) == 0 {
 			return nil, fmt.Errorf("collection %q not found: no ConfigMap with label %s=%s in namespace %s",
-				collectionName, collectionNameLabel, collectionName, sourceNamespace)
+				collectionName, collectionNameLabel, collectionName, r.Namespace)
 		}
 
 		src := &sourceList.Items[0]
