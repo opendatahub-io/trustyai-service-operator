@@ -547,21 +547,26 @@ func (r *EvalHubReconciler) reconcileProviderConfigMaps(ctx context.Context, ins
 	log := log.FromContext(ctx)
 	log.Info("Reconciling Provider ConfigMaps", "instance", instance.Name, "providers", instance.Spec.Providers)
 
+	sourceNamespace := r.Namespace
+	if instance.Spec.IsSingleTenancy() {
+		sourceNamespace = instance.Namespace
+	}
+
 	var cmNames []string
 	for _, providerName := range instance.Spec.Providers {
 		// Look up the source ConfigMap by both labels
 		var sourceList corev1.ConfigMapList
 		if err := r.List(ctx, &sourceList,
-			client.InNamespace(r.Namespace),
+			client.InNamespace(sourceNamespace),
 			client.MatchingLabels{
 				providerLabel:     "system",
 				providerNameLabel: providerName,
 			}); err != nil {
-			return nil, fmt.Errorf("failed to list provider ConfigMaps for %q in namespace %s: %w", providerName, r.Namespace, err)
+			return nil, fmt.Errorf("failed to list provider ConfigMaps for %q in namespace %s: %w", providerName, sourceNamespace, err)
 		}
 		if len(sourceList.Items) == 0 {
 			return nil, fmt.Errorf("provider %q not found: no ConfigMap with label %s=%s in namespace %s",
-				providerName, providerNameLabel, providerName, r.Namespace)
+				providerName, providerNameLabel, providerName, sourceNamespace)
 		}
 
 		src := &sourceList.Items[0]
@@ -620,21 +625,26 @@ func (r *EvalHubReconciler) reconcileCollectionConfigMaps(ctx context.Context, i
 	log := log.FromContext(ctx)
 	log.Info("Reconciling Collection ConfigMaps", "instance", instance.Name, "collections", instance.Spec.Collections)
 
+	sourceNamespace := r.Namespace
+	if instance.Spec.IsSingleTenancy() {
+		sourceNamespace = instance.Namespace
+	}
+
 	var cmNames []string
 	for _, collectionName := range instance.Spec.Collections {
 		// Look up the source ConfigMap by both labels
 		var sourceList corev1.ConfigMapList
 		if err := r.List(ctx, &sourceList,
-			client.InNamespace(r.Namespace),
+			client.InNamespace(sourceNamespace),
 			client.MatchingLabels{
 				collectionLabel:     "system",
 				collectionNameLabel: collectionName,
 			}); err != nil {
-			return nil, fmt.Errorf("failed to list collection ConfigMaps for %q in namespace %s: %w", collectionName, r.Namespace, err)
+			return nil, fmt.Errorf("failed to list collection ConfigMaps for %q in namespace %s: %w", collectionName, sourceNamespace, err)
 		}
 		if len(sourceList.Items) == 0 {
 			return nil, fmt.Errorf("collection %q not found: no ConfigMap with label %s=%s in namespace %s",
-				collectionName, collectionNameLabel, collectionName, r.Namespace)
+				collectionName, collectionNameLabel, collectionName, sourceNamespace)
 		}
 
 		src := &sourceList.Items[0]
