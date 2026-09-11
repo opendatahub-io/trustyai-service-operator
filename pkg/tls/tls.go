@@ -60,8 +60,6 @@ var IntermediateCiphers = []uint16{
 }
 
 var tlsVersionMap = map[configv1.TLSProtocolVersion]uint16{
-	"VersionTLS10": tls.VersionTLS10,
-	"VersionTLS11": tls.VersionTLS11,
 	"VersionTLS12": tls.VersionTLS12,
 	"VersionTLS13": tls.VersionTLS13,
 }
@@ -154,8 +152,6 @@ func parseProfile(profile *configv1.TLSSecurityProfile) (uint16, []uint16) {
 		return tls.VersionTLS12, IntermediateCiphers
 	case configv1.TLSProfileModernType:
 		return tls.VersionTLS13, nil
-	case configv1.TLSProfileOldType:
-		return tls.VersionTLS10, nil
 	case configv1.TLSProfileCustomType:
 		if profile.Custom == nil {
 			log.Info("Custom TLS profile type specified but custom block is nil, falling back to Intermediate")

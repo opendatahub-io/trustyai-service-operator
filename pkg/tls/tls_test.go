@@ -59,12 +59,12 @@ func TestParseProfile(t *testing.T) {
 			wantCiphers:    nil,
 		},
 		{
-			name: "Old returns TLS 1.0 with nil ciphers",
+			name: "Old falls back to Intermediate defaults",
 			profile: &configv1.TLSSecurityProfile{
 				Type: configv1.TLSProfileOldType,
 			},
-			wantMinVersion: tls.VersionTLS10,
-			wantCiphers:    nil,
+			wantMinVersion: tls.VersionTLS12,
+			wantCiphers:    IntermediateCiphers,
 		},
 		{
 			name: "Custom with valid ciphers",
@@ -112,6 +112,19 @@ func TestParseProfile(t *testing.T) {
 			},
 			wantMinVersion: tls.VersionTLS12,
 			wantCiphers:    IntermediateCiphers,
+		},
+		{
+			name: "Custom TLS 1.0 falls back to TLS 1.2",
+			profile: &configv1.TLSSecurityProfile{
+				Type: configv1.TLSProfileCustomType,
+				Custom: &configv1.CustomTLSProfile{
+					TLSProfileSpec: configv1.TLSProfileSpec{
+						MinTLSVersion: "VersionTLS10",
+					},
+				},
+			},
+			wantMinVersion: tls.VersionTLS12,
+			wantCiphers:    nil,
 		},
 		{
 			name: "Unknown type falls back to Intermediate",
