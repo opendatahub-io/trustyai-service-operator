@@ -538,6 +538,11 @@ func (r *EvalHubReconciler) validateImageConfiguration(ctx context.Context, imag
 //   - trustyai.opendatahub.io/evalhub-provider-type=system
 //   - trustyai.opendatahub.io/evalhub-provider-name=<name>
 //
+// In single-tenancy mode, if a system provider is not found in the operator namespace,
+// the reconciler falls back to searching for a tenant-labeled provider in the instance
+// namespace. This keeps system providers sourced from the trusted operator namespace
+// while allowing single-tenancy users to define providers in their own namespace.
+//
 // Returns the list of created ConfigMap names (for building projected volumes).
 func (r *EvalHubReconciler) reconcileProviderConfigMaps(ctx context.Context, instance *evalhubv1.EvalHub) ([]string, error) {
 	if len(instance.Spec.Providers) == 0 {
@@ -549,7 +554,7 @@ func (r *EvalHubReconciler) reconcileProviderConfigMaps(ctx context.Context, ins
 
 	var cmNames []string
 	for _, providerName := range instance.Spec.Providers {
-		// Look up the source ConfigMap by both labels
+		// Look up the source ConfigMap by both labels in the operator namespace
 		var sourceList corev1.ConfigMapList
 		if err := r.List(ctx, &sourceList,
 			client.InNamespace(r.Namespace),
@@ -559,6 +564,22 @@ func (r *EvalHubReconciler) reconcileProviderConfigMaps(ctx context.Context, ins
 			}); err != nil {
 			return nil, fmt.Errorf("failed to list provider ConfigMaps for %q in namespace %s: %w", providerName, r.Namespace, err)
 		}
+
+		if len(sourceList.Items) == 0 && instance.Spec.IsSingleTenancy() {
+			if err := r.List(ctx, &sourceList,
+				client.InNamespace(instance.Namespace),
+				client.MatchingLabels{
+					providerLabel:     providerTenantValue,
+					providerNameLabel: providerName,
+				}); err != nil {
+				return nil, fmt.Errorf("failed to list tenant provider ConfigMaps for %q in namespace %s: %w", providerName, instance.Namespace, err)
+			}
+			if len(sourceList.Items) > 1 {
+				return nil, fmt.Errorf("provider %q is ambiguous: found %d tenant ConfigMaps in namespace %s, expected exactly 1",
+					providerName, len(sourceList.Items), instance.Namespace)
+			}
+		}
+
 		if len(sourceList.Items) == 0 {
 			return nil, fmt.Errorf("provider %q not found: no ConfigMap with label %s=%s in namespace %s",
 				providerName, providerNameLabel, providerName, r.Namespace)
@@ -611,6 +632,10 @@ func (r *EvalHubReconciler) reconcileProviderConfigMaps(ctx context.Context, ins
 //   - trustyai.opendatahub.io/evalhub-collection-type=system
 //   - trustyai.opendatahub.io/evalhub-collection-name=<name>
 //
+// In single-tenancy mode, if a system collection is not found in the operator namespace,
+// the reconciler falls back to searching for a tenant-labeled collection in the instance
+// namespace.
+//
 // Returns the list of created ConfigMap names (for building projected volumes).
 func (r *EvalHubReconciler) reconcileCollectionConfigMaps(ctx context.Context, instance *evalhubv1.EvalHub) ([]string, error) {
 	if len(instance.Spec.Collections) == 0 {
@@ -622,7 +647,7 @@ func (r *EvalHubReconciler) reconcileCollectionConfigMaps(ctx context.Context, i
 
 	var cmNames []string
 	for _, collectionName := range instance.Spec.Collections {
-		// Look up the source ConfigMap by both labels
+		// Look up the source ConfigMap by both labels in the operator namespace
 		var sourceList corev1.ConfigMapList
 		if err := r.List(ctx, &sourceList,
 			client.InNamespace(r.Namespace),
@@ -632,6 +657,22 @@ func (r *EvalHubReconciler) reconcileCollectionConfigMaps(ctx context.Context, i
 			}); err != nil {
 			return nil, fmt.Errorf("failed to list collection ConfigMaps for %q in namespace %s: %w", collectionName, r.Namespace, err)
 		}
+
+		if len(sourceList.Items) == 0 && instance.Spec.IsSingleTenancy() {
+			if err := r.List(ctx, &sourceList,
+				client.InNamespace(instance.Namespace),
+				client.MatchingLabels{
+					collectionLabel:     collectionTenantValue,
+					collectionNameLabel: collectionName,
+				}); err != nil {
+				return nil, fmt.Errorf("failed to list tenant collection ConfigMaps for %q in namespace %s: %w", collectionName, instance.Namespace, err)
+			}
+			if len(sourceList.Items) > 1 {
+				return nil, fmt.Errorf("collection %q is ambiguous: found %d tenant ConfigMaps in namespace %s, expected exactly 1",
+					collectionName, len(sourceList.Items), instance.Namespace)
+			}
+		}
+
 		if len(sourceList.Items) == 0 {
 			return nil, fmt.Errorf("collection %q not found: no ConfigMap with label %s=%s in namespace %s",
 				collectionName, collectionNameLabel, collectionName, r.Namespace)
@@ -790,4 +831,92 @@ func (r *EvalHubReconciler) reconcileServiceCAConfigMap(ctx context.Context, ins
 		log.Info("Updating Service CA ConfigMap", "name", configMap.Name)
 		return r.Update(ctx, configMap)
 	}
+}
+
+// reconcileMLflowCABundleConfigMap builds the merged CA bundle that the eval-hub container
+// trusts when connecting to the MLflow tracking server. It concatenates, from the instance
+// namespace, the ODH trusted CA bundle (public/system + DSCI-provided CAs), the OpenShift
+// service-serving CA (internal *.svc trust), and an optional user-provided CA referenced by
+// spec.mlflow.tls.caBundle. MLFLOW_CA_CERT_PATH points at the resulting ConfigMap, so
+// MLFLOW_TRACKING_URI can target either the internal Service hostname or the public Route.
+// The bundle is regenerated on every reconcile, so CA rotations are picked up automatically.
+func (r *EvalHubReconciler) reconcileMLflowCABundleConfigMap(ctx context.Context, instance *evalhubv1.EvalHub) error {
+	log := log.FromContext(ctx)
+	log.Info("Reconciling MLflow CA bundle ConfigMap", "name", instance.Name)
+
+	var pemBlocks []string
+
+	// Source 1: ODH trusted CA bundle (public/system CAs + any DSCI trustedCABundle additions).
+	odhCM := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: instance.Namespace, Name: odhTrustedCABundleCMName}, odhCM); err == nil {
+		for _, key := range []string{"ca-bundle.crt", "odh-ca-bundle.crt"} {
+			if data, ok := odhCM.Data[key]; ok && strings.TrimSpace(data) != "" {
+				pemBlocks = append(pemBlocks, data)
+			}
+		}
+	} else if !errors.IsNotFound(err) {
+		return fmt.Errorf("reading %s ConfigMap: %w", odhTrustedCABundleCMName, err)
+	}
+
+	// Source 2: OpenShift service-serving CA (trust for the in-cluster MLflow *.svc hostname).
+	svcCM := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: instance.Namespace, Name: openshiftServiceCACMName}, svcCM); err == nil {
+		if data, ok := svcCM.Data[serviceCACertFile]; ok && strings.TrimSpace(data) != "" {
+			pemBlocks = append(pemBlocks, data)
+		}
+	} else if !errors.IsNotFound(err) {
+		return fmt.Errorf("reading %s ConfigMap: %w", openshiftServiceCACMName, err)
+	}
+
+	// Source 3: optional user-provided CA (e.g. the CA signing the MLflow public Route).
+	if ref := instance.Spec.MLflowCABundleRef(); ref != nil {
+		key := ref.Key
+		if key == "" {
+			key = mlflowCABundleFile
+		}
+		userCM := &corev1.ConfigMap{}
+		if err := r.Get(ctx, client.ObjectKey{Namespace: instance.Namespace, Name: ref.Name}, userCM); err != nil {
+			// The admin explicitly referenced this ConfigMap, so a missing/unreadable one is an error.
+			return fmt.Errorf("reading user MLflow CA bundle ConfigMap %q: %w", ref.Name, err)
+		}
+		data, ok := userCM.Data[key]
+		if !ok || strings.TrimSpace(data) == "" {
+			return fmt.Errorf("user MLflow CA bundle ConfigMap %q has no PEM data at key %q", ref.Name, key)
+		}
+		pemBlocks = append(pemBlocks, data)
+	}
+
+	if len(pemBlocks) == 0 {
+		// No CA sources found (e.g. non-OpenShift cluster). Still create an (empty) bundle so the
+		// deployment's MLFLOW_CA_CERT_PATH mount is always satisfiable; log so this is diagnosable.
+		log.Info("No CA sources found for MLflow CA bundle; creating empty bundle", "name", instance.Name)
+	}
+	merged := strings.Join(pemBlocks, "\n")
+
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      instance.Name + mlflowCABundleCMSuffix,
+			Namespace: instance.Namespace,
+		},
+	}
+
+	getErr := r.Get(ctx, client.ObjectKeyFromObject(configMap), configMap)
+	if getErr != nil && !errors.IsNotFound(getErr) {
+		return getErr
+	}
+
+	if errors.IsNotFound(getErr) {
+		configMap.Data = map[string]string{mlflowCABundleFile: merged}
+		if instance.UID != "" {
+			if err := controllerutil.SetControllerReference(instance, configMap, r.Scheme); err != nil {
+				return err
+			}
+		}
+		log.Info("Creating MLflow CA bundle ConfigMap", "name", configMap.Name)
+		return r.Create(ctx, configMap)
+	}
+
+	configMap.Data = map[string]string{mlflowCABundleFile: merged}
+	log.Info("Updating MLflow CA bundle ConfigMap", "name", configMap.Name)
+	return r.Update(ctx, configMap)
 }

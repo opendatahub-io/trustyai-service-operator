@@ -6,15 +6,21 @@ import (
 	"strings"
 	"time"
 
+	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
+	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster"
+	"github.com/opendatahub-io/odh-platform-utilities/pkg/controller/action"
+	"github.com/opendatahub-io/odh-platform-utilities/pkg/controller/conditions"
+	"github.com/opendatahub-io/odh-platform-utilities/pkg/controller/precondition"
+	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
+	statusPkg "github.com/opendatahub-io/odh-platform-utilities/pkg/status"
 	platformv1alpha1 "github.com/trustyai-explainability/trustyai-operator-module/pkg/apis/v1alpha1"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -30,6 +36,7 @@ type TrustyAIModuleReconciler struct {
 	Scheme                *runtime.Scheme
 	Namespace             string
 	ManifestsTemplatePath string
+	Deployer              *deploy.Deployer
 	EventRecorder         record.EventRecorder
 	SkipDependencyChecks  bool // set to true in tests to skip external dependency checks
 }
@@ -38,12 +45,15 @@ type TrustyAIModuleReconciler struct {
 // +kubebuilder:rbac:groups=components.platform.opendatahub.io,resources=trustyais/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=components.platform.opendatahub.io,resources=trustyais/finalizers,verbs=update
 // +kubebuilder:rbac:groups=serving.kserve.io,resources=inferenceservices,verbs=get;list
-// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=prometheuses,verbs=get;list
+// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=prometheuses,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch;update
-// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;patch
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;patch
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;patch
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;patch
+// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;patch
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;patch
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;patch
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
 func (r *TrustyAIModuleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -58,8 +68,6 @@ func (r *TrustyAIModuleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		logger.Error(err, "Failed to get TrustyAI module")
 		return ctrl.Result{}, err
 	}
-
-	oldStatus := module.Status.DeepCopy()
 
 	logger.Info("Reconciling TrustyAI module", "name", module.Name)
 
@@ -82,93 +90,76 @@ func (r *TrustyAIModuleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		logger.Error(err, "Failed to adopt in-tree resources")
 		r.EventRecorder.Event(module, "Warning", "MigrationFailed", fmt.Sprintf("SSA adoption failed: %v", err))
 
-		module.Status.Phase = PhaseNotReady
-		apimeta.SetStatusCondition(&module.Status.Conditions, metav1.Condition{
-			Type:               ConditionTypeProvisioningSucceeded,
-			Status:             metav1.ConditionFalse,
-			Reason:             "MigrationFailed",
-			Message:            fmt.Sprintf("SSA adoption failed: %v", err),
-			ObservedGeneration: module.Generation,
-		})
-		if statusErr := r.Status().Update(ctx, module); statusErr != nil {
-			logger.Error(statusErr, "Failed to update status after migration failure")
+		condMgr := r.newConditionManager(module)
+		condMgr.MarkFalse(string(common.ConditionTypeProvisioningSucceeded),
+			conditions.WithReason("MigrationFailed"),
+			conditions.WithMessage("SSA adoption failed: %v", err),
+			conditions.WithObservedGeneration(module.Generation),
+		)
+		module.Status.ObservedGeneration = module.Generation
+		condMgr.Sort()
+		if updateErr := r.persistStatus(ctx, module); updateErr != nil {
+			logger.Error(updateErr, "Failed to update status after migration failure")
 		}
 		return ctrl.Result{}, err
 	}
 
 	module.Status.ObservedGeneration = module.Generation
 	if module.Status.Phase == "" {
-		module.Status.Phase = PhaseNotReady
+		module.Status.Phase = common.PhaseNotReady
 	}
 
-	if module.Spec.ManagementState == platformv1alpha1.ManagementStateRemoved {
-		return r.handleRemoval(ctx, module, oldStatus)
-	}
-	if module.Spec.ManagementState == platformv1alpha1.ManagementStateUnmanaged {
-		return r.handleUnmanaged(ctx, module, oldStatus)
+	if module.Spec.ManagementState == common.Removed {
+		return r.handleRemoval(ctx, module)
 	}
 
+	// An empty enabledServices object means that all TrustyAI service workloads
+	// are enabled for platform-managed module CRs, which do not currently
+	// project per-service selections.
+	enabledServices := effectiveEnabledServices(module.Spec.EnabledServices)
+
+	// Build the condition manager for this reconcile cycle.
+	condMgr := r.newConditionManager(module)
+
+	// Run pre-conditions (dependency checks) unless explicitly skipped (test mode).
 	if !r.SkipDependencyChecks {
-		dependencyResults, err := r.checkDependencies(ctx)
-		if err != nil {
-			logger.Error(err, "Failed to check dependencies")
-			return ctrl.Result{}, err
+		rr := &action.ReconciliationRequest{
+			Client:     r.Client,
+			Instance:   module,
+			Conditions: condMgr,
 		}
-
-		if allDependenciesSatisfied(dependencyResults) {
-			apimeta.SetStatusCondition(&module.Status.Conditions, metav1.Condition{
-				Type:               ConditionTypeDependenciesMet,
-				Status:             metav1.ConditionTrue,
-				Reason:             "AllDependenciesMet",
-				Message:            formatDependencyMessages(dependencyResults),
-				ObservedGeneration: module.Generation,
-			})
-		} else {
-			apimeta.SetStatusCondition(&module.Status.Conditions, metav1.Condition{
-				Type:               ConditionTypeDependenciesMet,
-				Status:             metav1.ConditionFalse,
-				Reason:             "DependenciesMissing",
-				Message:            formatDependencyMessages(dependencyResults),
-				ObservedGeneration: module.Generation,
-			})
-			module.Status.Phase = PhaseNotReady
-			apimeta.SetStatusCondition(&module.Status.Conditions, metav1.Condition{
-				Type:               ConditionTypeReady,
-				Status:             metav1.ConditionFalse,
-				Reason:             "DependenciesMissing",
-				Message:            "Cannot deploy: " + formatDependencyMessages(dependencyResults),
-				ObservedGeneration: module.Generation,
-			})
-			apimeta.SetStatusCondition(&module.Status.Conditions, metav1.Condition{
-				Type:               ConditionTypeProvisioningSucceeded,
-				Status:             metav1.ConditionFalse,
-				Reason:             "DependenciesMissing",
-				Message:            "Cannot provision: " + formatDependencyMessages(dependencyResults),
-				ObservedGeneration: module.Generation,
-			})
-			apimeta.SetStatusCondition(&module.Status.Conditions, metav1.Condition{
-				Type:               ConditionTypeDegraded,
-				Status:             metav1.ConditionFalse,
-				Reason:             "DependenciesMissing",
-				Message:            "Module is not deployed",
-				ObservedGeneration: module.Generation,
-			})
-
-			if err := r.Status().Update(ctx, module); err != nil {
+		if stop := precondition.RunAll(ctx, rr, cluster.ClusterType(""), modulePreConditions); stop {
+			module.Status.Phase = common.PhaseNotReady
+			module.Status.ObservedGeneration = module.Generation
+			condMgr.Sort()
+			if err := r.persistStatus(ctx, module); err != nil {
 				logger.Error(err, "Failed to update status after dependency check")
 				return ctrl.Result{}, err
 			}
-			logger.Info("Blocking deployment due to missing dependencies", "message", formatDependencyMessages(dependencyResults))
+			logger.Info("Blocking deployment due to missing dependencies")
 			return ctrl.Result{RequeueAfter: time.Duration(DefaultRequeueInterval) * time.Second}, nil
 		}
 	} else {
-		apimeta.SetStatusCondition(&module.Status.Conditions, metav1.Condition{
-			Type:               ConditionTypeDependenciesMet,
-			Status:             metav1.ConditionTrue,
-			Reason:             "ChecksSkipped",
-			Message:            "Dependency checks skipped (test mode)",
-			ObservedGeneration: module.Generation,
-		})
+		condMgr.MarkTrue(ConditionTypeDependenciesAvailable,
+			conditions.WithReason("ChecksSkipped"),
+			conditions.WithMessage("Dependency checks skipped (test mode)"),
+			conditions.WithObservedGeneration(module.Generation),
+		)
+		condMgr.MarkTrue(ConditionTypeKServeAvailable,
+			conditions.WithReason("ChecksSkipped"),
+			conditions.WithMessage("Dependency checks skipped (test mode)"),
+			conditions.WithObservedGeneration(module.Generation),
+		)
+	}
+
+	if err := r.reconcileComponent(ctx, module, condMgr, enabledServices); err != nil {
+		logger.Error(err, "Failed to deploy workload operator")
+		module.Status.ObservedGeneration = module.Generation
+		condMgr.Sort()
+		if updateErr := r.persistStatus(ctx, module); updateErr != nil {
+			logger.Error(updateErr, "Failed to update status after deploy failure")
+		}
+		return ctrl.Result{}, err
 	}
 
 	if err := r.reconcileConfigMap(ctx, module); err != nil {
@@ -176,25 +167,34 @@ func (r *TrustyAIModuleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 
-	if err := r.updateHealthStatus(ctx, module); err != nil {
-		logger.Error(err, "Failed to update health status")
+	r.updateHealthStatus(ctx, module, condMgr, enabledServices)
+	r.updateReleases(module)
+	if err := r.updatePlatformRelease(ctx, module); err != nil {
+		logger.Error(err, "Failed to update platform release")
+	}
+
+	module.Status.ObservedGeneration = module.Generation
+	condMgr.Sort()
+	if err := r.persistStatus(ctx, module); err != nil {
+		logger.Error(err, "Failed to update TrustyAI module status")
 		return ctrl.Result{}, err
 	}
-
-	r.updateReleases(module)
-
-	if !equality.Semantic.DeepEqual(oldStatus, &module.Status) {
-		if err := r.updateStatus(ctx, module, func(saved *platformv1alpha1.TrustyAI) {
-			saved.Status = *module.Status.DeepCopy()
-		}); err != nil {
-			logger.Error(err, "Failed to update TrustyAI module status")
-			return ctrl.Result{}, err
-		}
-		r.EventRecorder.Event(module, corev1.EventTypeNormal, EventReasonStatusUpdated,
-			fmt.Sprintf("Module status updated, phase: %s", module.Status.Phase))
-	}
+	r.EventRecorder.Event(module, corev1.EventTypeNormal, EventReasonStatusUpdated,
+		fmt.Sprintf("Module status updated, phase: %s", module.Status.Phase))
 
 	return ctrl.Result{RequeueAfter: time.Duration(DefaultRequeueInterval) * time.Second}, nil
+}
+
+// newConditionManager creates a conditions.Manager bound to module, pre-registering
+// the standard set of condition types used by TrustyAI.
+func (r *TrustyAIModuleReconciler) newConditionManager(module *platformv1alpha1.TrustyAI) *conditions.Manager {
+	return conditions.NewManager(
+		module,
+		string(common.ConditionTypeReady),
+		string(common.ConditionTypeProvisioningSucceeded),
+		string(common.ConditionTypeDegraded),
+		ConditionTypeDependenciesAvailable,
+	)
 }
 
 func (r *TrustyAIModuleReconciler) handleDeletion(ctx context.Context, module *platformv1alpha1.TrustyAI) (ctrl.Result, error) {
@@ -210,6 +210,12 @@ func (r *TrustyAIModuleReconciler) handleDeletion(ctx context.Context, module *p
 			return ctrl.Result{}, err
 		}
 
+		if err := r.deleteClusterScopedRBAC(ctx); err != nil {
+			logger.Error(err, "Failed to delete cluster-scoped RBAC during cleanup")
+			r.EventRecorder.Event(module, "Warning", "CleanupFailed", "Failed to delete cluster-scoped RBAC during cleanup")
+			return ctrl.Result{}, err
+		}
+
 		controllerutil.RemoveFinalizer(module, FinalizerName)
 		if err := r.Update(ctx, module); err != nil {
 			logger.Error(err, "Failed to remove finalizer")
@@ -222,239 +228,277 @@ func (r *TrustyAIModuleReconciler) handleDeletion(ctx context.Context, module *p
 	return ctrl.Result{}, nil
 }
 
-func (r *TrustyAIModuleReconciler) handleRemoval(ctx context.Context, module *platformv1alpha1.TrustyAI, oldStatus *platformv1alpha1.TrustyAIStatus) (ctrl.Result, error) {
+func (r *TrustyAIModuleReconciler) handleRemoval(ctx context.Context, module *platformv1alpha1.TrustyAI) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.Info("TrustyAI module is in Removed state, skipping reconciliation")
 
-	module.Status.Phase = PhaseNotReady
+	condMgr := r.newConditionManager(module)
+	condMgr.MarkFalse(string(common.ConditionTypeReady),
+		conditions.WithReason("ModuleRemoved"),
+		conditions.WithMessage("Module management state is set to Removed"),
+		conditions.WithObservedGeneration(module.Generation),
+	)
+	condMgr.MarkFalse(string(common.ConditionTypeProvisioningSucceeded),
+		conditions.WithReason("ModuleRemoved"),
+		conditions.WithMessage("Module management state is set to Removed"),
+		conditions.WithObservedGeneration(module.Generation),
+	)
+	condMgr.MarkFalse(string(common.ConditionTypeDegraded),
+		conditions.WithReason("ModuleRemoved"),
+		conditions.WithMessage("Module is not deployed"),
+		conditions.WithObservedGeneration(module.Generation),
+		conditions.WithSeverity(common.ConditionSeverityInfo),
+	)
 
-	apimeta.SetStatusCondition(&module.Status.Conditions, metav1.Condition{
-		Type:               ConditionTypeReady,
-		Status:             metav1.ConditionFalse,
-		Reason:             "ModuleRemoved",
-		Message:            "Module management state is set to Removed",
-		ObservedGeneration: module.Generation,
-	})
-	apimeta.SetStatusCondition(&module.Status.Conditions, metav1.Condition{
-		Type:               ConditionTypeProvisioningSucceeded,
-		Status:             metav1.ConditionFalse,
-		Reason:             "ModuleRemoved",
-		Message:            "Module management state is set to Removed",
-		ObservedGeneration: module.Generation,
-	})
-	apimeta.SetStatusCondition(&module.Status.Conditions, metav1.Condition{
-		Type:               ConditionTypeDegraded,
-		Status:             metav1.ConditionFalse,
-		Reason:             "ModuleRemoved",
-		Message:            "Module is not deployed",
-		ObservedGeneration: module.Generation,
-	})
-
-	if !equality.Semantic.DeepEqual(oldStatus, &module.Status) {
-		if err := r.updateStatus(ctx, module, func(saved *platformv1alpha1.TrustyAI) {
-			saved.Status = *module.Status.DeepCopy()
-		}); err != nil {
-			logger.Error(err, "Failed to update TrustyAI module status")
-			return ctrl.Result{}, err
-		}
-		r.EventRecorder.Event(module, corev1.EventTypeNormal, EventReasonRemoved,
-			"Module management state is Removed; reconciliation skipped")
+	module.Status.Phase = common.PhaseNotReady
+	module.Status.ObservedGeneration = module.Generation
+	condMgr.Sort()
+	if err := r.persistStatus(ctx, module); err != nil {
+		logger.Error(err, "Failed to update TrustyAI module status")
+		return ctrl.Result{}, err
 	}
+	r.EventRecorder.Event(module, corev1.EventTypeNormal, EventReasonRemoved,
+		"Module management state is Removed; reconciliation skipped")
 
 	return ctrl.Result{}, nil
 }
 
-func (r *TrustyAIModuleReconciler) handleUnmanaged(ctx context.Context, module *platformv1alpha1.TrustyAI, oldStatus *platformv1alpha1.TrustyAIStatus) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-	logger.Info("TrustyAI module is in Unmanaged state, skipping reconciliation")
-
-	apimeta.SetStatusCondition(&module.Status.Conditions, metav1.Condition{
-		Type:               ConditionTypeReady,
-		Status:             metav1.ConditionUnknown,
-		Reason:             ReasonModuleUnmanaged,
-		Message:            "Module management state is set to Unmanaged",
-		ObservedGeneration: module.Generation,
-	})
-	apimeta.SetStatusCondition(&module.Status.Conditions, metav1.Condition{
-		Type:               ConditionTypeProvisioningSucceeded,
-		Status:             metav1.ConditionUnknown,
-		Reason:             ReasonModuleUnmanaged,
-		Message:            "Module management state is set to Unmanaged",
-		ObservedGeneration: module.Generation,
-	})
-	apimeta.SetStatusCondition(&module.Status.Conditions, metav1.Condition{
-		Type:               ConditionTypeDegraded,
-		Status:             metav1.ConditionUnknown,
-		Reason:             ReasonModuleUnmanaged,
-		Message:            "Module management state is set to Unmanaged",
-		ObservedGeneration: module.Generation,
-	})
-
-	if !equality.Semantic.DeepEqual(oldStatus, &module.Status) {
-		if err := r.updateStatus(ctx, module, func(saved *platformv1alpha1.TrustyAI) {
-			saved.Status = *module.Status.DeepCopy()
-		}); err != nil {
-			logger.Error(err, "Failed to update TrustyAI module status")
-			return ctrl.Result{}, err
+func effectiveEnabledServices(es platformv1alpha1.EnabledServices) platformv1alpha1.EnabledServices {
+	if es == (platformv1alpha1.EnabledServices{}) {
+		return platformv1alpha1.EnabledServices{
+			TAS:            true,
+			LMES:           true,
+			EvalHub:        true,
+			GORCH:          true,
+			NemoGuardrails: true,
 		}
-		r.EventRecorder.Event(module, corev1.EventTypeNormal, EventReasonUnmanaged,
-			"Module management state is Unmanaged; reconciliation skipped")
+	}
+	return es
+}
+
+// persistStatus normalizes conditions before writing status. Older platform
+// versions validate reason, message, and lastTransitionTime as required
+// fields, while the current common API intentionally makes them optional.
+// Keeping the emitted status complete lets this module work with either CRD
+// schema and avoids masking the original reconciliation error with a status
+// validation error.
+func (r *TrustyAIModuleReconciler) persistStatus(ctx context.Context, module *platformv1alpha1.TrustyAI) error {
+	for i := range module.Status.Conditions {
+		condition := &module.Status.Conditions[i]
+		if condition.LastTransitionTime.IsZero() {
+			condition.LastTransitionTime = metav1.Now()
+		}
+		if condition.Reason == "" {
+			condition.Reason = "ConditionNotSet"
+		}
+		if condition.Message == "" {
+			condition.Message = "Condition has not been evaluated"
+		}
 	}
 
-	return ctrl.Result{}, nil
-}
-
-func (r *TrustyAIModuleReconciler) updateStatus(
-	ctx context.Context,
-	original *platformv1alpha1.TrustyAI,
-	update func(saved *platformv1alpha1.TrustyAI),
-) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		saved := &platformv1alpha1.TrustyAI{}
-		if err := r.Client.Get(ctx, client.ObjectKeyFromObject(original), saved); err != nil {
-			return err
-		}
-		update(saved)
-		return r.Client.Status().Update(ctx, saved)
+	desired := module.Status.DeepCopy()
+	return statusPkg.Update(ctx, r.Client, module, func(o *platformv1alpha1.TrustyAI) {
+		o.Status = *desired
 	})
 }
 
-func (r *TrustyAIModuleReconciler) buildHealthCheckers(module *platformv1alpha1.TrustyAI) []ServiceHealthChecker {
+func (r *TrustyAIModuleReconciler) buildHealthCheckers(es platformv1alpha1.EnabledServices) []ServiceHealthChecker {
 	var checkers []ServiceHealthChecker
-	es := module.Spec.EnabledServices
 	if es.TAS {
-		checkers = append(checkers, NewRunningServiceChecker("TAS", r.Client, r.Namespace))
+		checkers = append(checkers, NewOperandHealthChecker("TAS", r.Client))
 	}
 	if es.LMES {
-		checkers = append(checkers, NewRunningServiceChecker("LMES", r.Client, r.Namespace))
+		checkers = append(checkers, NewOperandHealthChecker("LMES", r.Client))
 	}
 	if es.EvalHub {
-		checkers = append(checkers, NewRunningServiceChecker("EVALHUB", r.Client, r.Namespace))
+		checkers = append(checkers, NewOperandHealthChecker("EVALHUB", r.Client))
 	}
 	if es.GORCH {
-		checkers = append(checkers, NewRunningServiceChecker("GORCH", r.Client, r.Namespace))
+		checkers = append(checkers, NewOperandHealthChecker("GORCH", r.Client))
 	}
 	if es.NemoGuardrails {
-		checkers = append(checkers, NewRunningServiceChecker("NEMO_GUARDRAILS", r.Client, r.Namespace))
+		checkers = append(checkers, NewOperandHealthChecker("NEMO_GUARDRAILS", r.Client))
 	}
 	return checkers
 }
 
-func (r *TrustyAIModuleReconciler) updateHealthStatus(ctx context.Context, module *platformv1alpha1.TrustyAI) error {
+func (r *TrustyAIModuleReconciler) updateHealthStatus(
+	ctx context.Context,
+	module *platformv1alpha1.TrustyAI,
+	condMgr *conditions.Manager,
+	es platformv1alpha1.EnabledServices,
+) {
 	logger := log.FromContext(ctx)
 
-	var (
-		oldReadyStatus metav1.ConditionStatus
-		hadReady       bool
-	)
-	if c := apimeta.FindStatusCondition(module.Status.Conditions, ConditionTypeReady); c != nil {
-		oldReadyStatus = c.Status
-		hadReady = true
+	prevDegraded := false
+	if degradedCond := condMgr.GetCondition(string(common.ConditionTypeDegraded)); degradedCond != nil {
+		prevDegraded = degradedCond.Status == metav1.ConditionTrue
 	}
 
-	healthCheckers := r.buildHealthCheckers(module)
+	healthCheckers := r.buildHealthCheckers(es)
 	allHealthy := true
-	partiallyHealthy := false
+	anyDegraded := false
+	anyUnknown := false
 	var unhealthyReasons []string
 
 	for _, checker := range healthCheckers {
-		healthy, reason := checker.IsHealthy(ctx)
-		if !healthy {
+		result := checker.Check(ctx)
+		if !result.Healthy {
 			allHealthy = false
-			unhealthyReasons = append(unhealthyReasons, fmt.Sprintf("%s: %s", checker.Name(), reason))
-			logger.Info("Service unhealthy", "service", checker.Name(), "reason", reason)
-		} else {
-			partiallyHealthy = true
+			unhealthyReasons = append(unhealthyReasons, fmt.Sprintf("%s: %s", checker.Name(), result.Reason))
+			logger.Info("Service not ready", "service", checker.Name(), "reason", result.Reason, "degraded", result.Degraded)
+		}
+		if result.Degraded {
+			anyDegraded = true
+		}
+		if result.Unknown {
+			anyUnknown = true
 		}
 	}
+
+	prevPhase := module.Status.Phase
 
 	if allHealthy {
-		module.Status.Phase = PhaseReady
-		apimeta.SetStatusCondition(&module.Status.Conditions, metav1.Condition{
-			Type:               ConditionTypeReady,
-			Status:             metav1.ConditionTrue,
-			Reason:             "AllServicesHealthy",
-			Message:            "All enabled services are healthy",
-			ObservedGeneration: module.Generation,
-		})
-		apimeta.SetStatusCondition(&module.Status.Conditions, metav1.Condition{
-			Type:               ConditionTypeProvisioningSucceeded,
-			Status:             metav1.ConditionTrue,
-			Reason:             "ProvisioningComplete",
-			Message:            "Module provisioning completed successfully",
-			ObservedGeneration: module.Generation,
-		})
-		apimeta.SetStatusCondition(&module.Status.Conditions, metav1.Condition{
-			Type:               ConditionTypeDegraded,
-			Status:             metav1.ConditionFalse,
-			Reason:             "FullyFunctional",
-			Message:            "All services are fully functional",
-			ObservedGeneration: module.Generation,
-		})
+		module.Status.Phase = common.PhaseReady
+		condMgr.MarkTrue(string(common.ConditionTypeReady),
+			conditions.WithReason("AllServicesHealthy"),
+			conditions.WithMessage("All enabled services are healthy"),
+			conditions.WithObservedGeneration(module.Generation),
+		)
+		condMgr.MarkTrue(string(common.ConditionTypeProvisioningSucceeded),
+			conditions.WithReason("ProvisioningComplete"),
+			conditions.WithMessage("Module provisioning completed successfully"),
+			conditions.WithObservedGeneration(module.Generation),
+		)
+		condMgr.MarkFalse(string(common.ConditionTypeDegraded),
+			conditions.WithReason("FullyFunctional"),
+			conditions.WithMessage("All services are fully functional"),
+			conditions.WithObservedGeneration(module.Generation),
+			conditions.WithSeverity(common.ConditionSeverityInfo),
+		)
 	} else {
-		module.Status.Phase = PhaseNotReady
-		apimeta.SetStatusCondition(&module.Status.Conditions, metav1.Condition{
-			Type:               ConditionTypeReady,
-			Status:             metav1.ConditionFalse,
-			Reason:             "ServicesUnhealthy",
-			Message:            strings.Join(unhealthyReasons, "; "),
-			ObservedGeneration: module.Generation,
-		})
-		apimeta.SetStatusCondition(&module.Status.Conditions, metav1.Condition{
-			Type:               ConditionTypeProvisioningSucceeded,
-			Status:             metav1.ConditionFalse,
-			Reason:             "ServicesUnhealthy",
-			Message:            "One or more services are not healthy",
-			ObservedGeneration: module.Generation,
-		})
+		module.Status.Phase = common.PhaseNotReady
+		condMgr.MarkTrue(string(common.ConditionTypeProvisioningSucceeded),
+			conditions.WithReason("ProvisioningComplete"),
+			conditions.WithMessage("Module manifests applied; waiting for enabled operand instances"),
+			conditions.WithObservedGeneration(module.Generation),
+		)
 
-		if partiallyHealthy {
-			apimeta.SetStatusCondition(&module.Status.Conditions, metav1.Condition{
-				Type:               ConditionTypeDegraded,
-				Status:             metav1.ConditionTrue,
-				Reason:             "PartialFunctionality",
-				Message:            "Some services are unavailable: " + strings.Join(unhealthyReasons, "; "),
-				ObservedGeneration: module.Generation,
-			})
+		if anyDegraded {
+			condMgr.MarkTrue(string(common.ConditionTypeDegraded),
+				conditions.WithReason("OperandUnhealthy"),
+				conditions.WithMessage("One or more operand instances are unhealthy: %s", strings.Join(unhealthyReasons, "; ")),
+				conditions.WithObservedGeneration(module.Generation),
+			)
 		} else {
-			apimeta.SetStatusCondition(&module.Status.Conditions, metav1.Condition{
-				Type:               ConditionTypeDegraded,
-				Status:             metav1.ConditionTrue,
-				Reason:             "AllServicesUnhealthy",
-				Message:            "All services are unavailable: " + strings.Join(unhealthyReasons, "; "),
-				ObservedGeneration: module.Generation,
-			})
+			condMgr.MarkFalse(string(common.ConditionTypeDegraded),
+				conditions.WithReason("WaitingForOperands"),
+				conditions.WithMessage("Waiting for enabled operand instances: %s", strings.Join(unhealthyReasons, "; ")),
+				conditions.WithObservedGeneration(module.Generation),
+				conditions.WithSeverity(common.ConditionSeverityInfo),
+			)
+		}
+		// Mark Ready after the dependent conditions. The conditions manager
+		// aggregates dependents into Ready, so this final write preserves the
+		// module-level readiness result for both waiting and failed operands.
+		if anyUnknown && !anyDegraded {
+			condMgr.MarkUnknown(string(common.ConditionTypeReady),
+				conditions.WithReason("OperandHealthUnknown"),
+				conditions.WithMessage("%s", strings.Join(unhealthyReasons, "; ")),
+				conditions.WithObservedGeneration(module.Generation),
+			)
+		} else {
+			condMgr.MarkFalse(string(common.ConditionTypeReady),
+				conditions.WithReason("ServicesNotReady"),
+				conditions.WithMessage("%s", strings.Join(unhealthyReasons, "; ")),
+				conditions.WithObservedGeneration(module.Generation),
+			)
 		}
 	}
 
-	logger.Info("Updated health status", "phase", module.Status.Phase,
-		"ready", apimeta.IsStatusConditionTrue(module.Status.Conditions, ConditionTypeReady))
+	logger.Info("Updated health status", "phase", module.Status.Phase)
 
-	newReady := apimeta.FindStatusCondition(module.Status.Conditions, ConditionTypeReady)
-	if !hadReady || newReady == nil || oldReadyStatus != newReady.Status {
+	if prevPhase != module.Status.Phase || prevDegraded != anyDegraded {
 		if allHealthy {
 			r.EventRecorder.Event(module, "Normal", "HealthCheckPassed", "All enabled services are healthy")
-		} else if partiallyHealthy {
-			r.EventRecorder.Event(module, "Warning", "HealthCheckPartial", "Some services are unhealthy")
+		} else if anyDegraded {
+			r.EventRecorder.Event(module, "Warning", "HealthCheckFailed", "One or more operand instances are unhealthy")
 		} else {
-			r.EventRecorder.Event(module, "Warning", "HealthCheckFailed", "All services are unhealthy")
+			r.EventRecorder.Event(module, "Normal", "HealthCheckWaiting", "Waiting for enabled operand instances")
 		}
+	}
+}
+
+func (r *TrustyAIModuleReconciler) updateReleases(module *platformv1alpha1.TrustyAI) {
+	module.Status.SetRelease(common.ComponentRelease{
+		Name:    "trustyai-operator-module",
+		Version: Version,
+	})
+}
+
+// reconcileComponent renders the Kustomize overlay for the trustyai-service-operator
+// and SSA-applies all resources into the cluster. On failure it marks
+// ConditionTypeProvisioningSucceeded False and returns the error so the caller
+// can persist status and requeue. On success it returns nil and lets
+// updateHealthStatus own the condition.
+//
+// When r.Deployer is nil the method is a no-op (test mode or stub manifests).
+func (r *TrustyAIModuleReconciler) reconcileComponent(
+	ctx context.Context,
+	module *platformv1alpha1.TrustyAI,
+	condMgr *conditions.Manager,
+	es platformv1alpha1.EnabledServices,
+) error {
+	if r.Deployer == nil {
+		return nil
+	}
+
+	objs, err := RenderManifests(ctx, r.ManifestsTemplatePath, r.Namespace)
+	if err != nil {
+		condMgr.MarkFalse(string(common.ConditionTypeProvisioningSucceeded),
+			conditions.WithReason("RenderFailed"),
+			conditions.WithMessage("Failed to render operator manifests: %v", err),
+			conditions.WithObservedGeneration(module.Generation),
+		)
+		return err
+	}
+
+	if len(objs) == 0 {
+		return nil
+	}
+
+	if err := injectEnabledServices(objs, es); err != nil {
+		condMgr.MarkFalse(string(common.ConditionTypeProvisioningSucceeded),
+			conditions.WithReason("RenderFailed"),
+			conditions.WithMessage("Failed to configure enabled services: %v", err),
+			conditions.WithObservedGeneration(module.Generation),
+		)
+		return err
+	}
+
+	if err := r.Deployer.Deploy(ctx, deploy.DeployInput{
+		Client:    r.Client,
+		Owner:     module,
+		Release:   deploy.ReleaseInfo{Version: Version},
+		Resources: objs,
+	}); err != nil {
+		condMgr.MarkFalse(string(common.ConditionTypeProvisioningSucceeded),
+			conditions.WithReason("DeployFailed"),
+			conditions.WithMessage("Failed to deploy operator resources: %v", err),
+			conditions.WithObservedGeneration(module.Generation),
+		)
+		return err
 	}
 
 	return nil
 }
 
-func (r *TrustyAIModuleReconciler) updateReleases(module *platformv1alpha1.TrustyAI) {
-	module.Status.Releases = []platformv1alpha1.ComponentRelease{
-		{
-			Name:    "trustyai-operator-module",
-			Version: Version,
-		},
-	}
-}
-
 func (r *TrustyAIModuleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&platformv1alpha1.TrustyAI{}).
+		Owns(&corev1.ServiceAccount{}).
+		Owns(&corev1.Service{}).
+		Owns(&appsv1.Deployment{}).
+		Owns(&rbacv1.RoleBinding{}).
 		Complete(r)
 }

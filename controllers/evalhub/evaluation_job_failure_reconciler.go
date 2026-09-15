@@ -21,12 +21,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/trustyai-explainability/trustyai-service-operator/pkg/tracing"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/transport"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -73,6 +77,17 @@ const (
 	sidecarContainerName    = "sidecar"
 )
 
+// Job lifecycle label and annotation stamped by the operator on infrastructure failures.
+// The same label is also set by the EvalHub server; the operator checks it to prevent duplicate Events.
+const (
+	labelEvaluationPhase       = "trustyai.opendatahub.io/evaluation-phase"
+	labelEvaluationPhaseFailed = "Failed"
+	annotationEvaluationStatus = "trustyai.opendatahub.io/evaluation-status"
+	// eventReasonEvaluationFailed matches the reason used by server-emitted Events; source.component
+	// distinguishes operator vs server (set automatically by the EventRecorder).
+	eventReasonEvaluationFailed = "EvaluationFailed"
+)
+
 // evalHubEvaluationJobFailureControllerName matches ctrl.NewControllerManagedBy(mgr).Named(...) for logs and registration.
 const evalHubEvaluationJobFailureControllerName = "evalhub-evaluation-job-failure"
 
@@ -89,6 +104,7 @@ func failureWatcherLogFields() []any {
 //+kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=pods/log,verbs=get
+//+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=trustyai.opendatahub.io,resources=evalhubs,verbs=get;list;watch
 
 // EvalHubEvaluationJobFailureReconciler POSTs a failed benchmark event to EvalHub when init, adapter,
@@ -101,7 +117,8 @@ func failureWatcherLogFields() []any {
 type EvalHubEvaluationJobFailureReconciler struct {
 	client.Client
 	// RESTConfig is used to build an HTTP transport that authenticates like the operator (SA token + cluster CA).
-	RESTConfig *rest.Config
+	RESTConfig    *rest.Config
+	EventRecorder record.EventRecorder
 
 	// tenantNS tracks namespaces labelled evalhub.trustyai.opendatahub.io/tenant (shared with the Kueue workload failure reconciler).
 	tenantNS *evalHubTenantNamespaces
@@ -168,9 +185,10 @@ func registerEvalHubEvaluationJobFailureController(mgr manager.Manager, tenantNS
 	}
 
 	r := &EvalHubEvaluationJobFailureReconciler{
-		Client:     mgr.GetClient(),
-		RESTConfig: rest.CopyConfig(mgr.GetConfig()),
-		tenantNS:   tenantNS,
+		Client:        mgr.GetClient(),
+		RESTConfig:    rest.CopyConfig(mgr.GetConfig()),
+		tenantNS:      tenantNS,
+		EventRecorder: mgr.GetEventRecorderFor("trustyai-service-operator"),
 	}
 
 	labelPred, err := predicate.LabelSelectorPredicate(evalHubJobPodLabelSelector())
@@ -306,7 +324,7 @@ func podOwnedByJob(pod *corev1.Pod) bool {
 	return jobNameFromPodOwner(pod) != ""
 }
 
-func (r *EvalHubEvaluationJobFailureReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *EvalHubEvaluationJobFailureReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
 	log := log.FromContext(ctx)
 	log.Info("reconcile start",
 		append(failureWatcherLogFields(), "action", "reconcile", "namespace", req.Namespace, "name", req.Name)...)
@@ -321,8 +339,33 @@ func (r *EvalHubEvaluationJobFailureReconciler) Reconcile(ctx context.Context, r
 	if !r.tenantNS.IsTenant(job.Namespace) {
 		return ctrl.Result{}, nil
 	}
+
+	ctx, span := tracing.StartReconcileSpan(ctx, evalHubTracerName, spanJobFailureReconcile,
+		attribute.String("k8s.namespace", job.Namespace),
+		attribute.String("evalhub.job.name", job.Name),
+	)
+	reconcileStart := time.Now()
+	defer func() {
+		finishEvalHubReconcileSpan(span, metricControllerJobFailure, reconcileStart, result, err)
+		span.End()
+	}()
+
+	setJobFailureAction := func(action string) {
+		span.SetAttributes(attribute.String("evalhub.job_failure.action", action))
+	}
+
 	if failureAlreadyReported(&job) {
-		// POST succeeded in a prior reconcile; ensure the Job is removed (delete may have failed after patch).
+		setJobFailureAction("delete")
+		if err := r.deleteEvalHubFailureSyncedJob(ctx, &job); err != nil {
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		return ctrl.Result{}, nil
+	}
+	if serverAlreadyHandledFailure(&job) {
+		log.Info("skip: EvalHub server already set failure label",
+			append(failureWatcherLogFields(), "action", "skip_server_handled",
+				"job", job.Name, "namespace", job.Namespace)...)
+		setJobFailureAction("delete")
 		if err := r.deleteEvalHubFailureSyncedJob(ctx, &job); err != nil {
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
@@ -336,6 +379,7 @@ func (r *EvalHubEvaluationJobFailureReconciler) Reconcile(ctx context.Context, r
 	if !failed {
 		log.Info("skip EvalHub POST: no operator-only container failure",
 			append(failureWatcherLogFields(), "action", "skip_no_operator_failure", "job", job.Name, "namespace", job.Namespace)...)
+		setJobFailureAction("skip")
 		if requeue := r.pendingSchedulingRequeueAfter(ctx, &job); requeue > 0 {
 			log.Info("pod unschedulable within grace period — requeuing",
 				append(failureWatcherLogFields(), "action", "requeue_scheduling_grace", "job", job.Name, "namespace", job.Namespace, "requeueAfter", requeue)...)
@@ -343,6 +387,14 @@ func (r *EvalHubEvaluationJobFailureReconciler) Reconcile(ctx context.Context, r
 		}
 		return ctrl.Result{}, nil
 	}
+
+	span.SetAttributes(
+		attribute.String("evalhub.job.failure_reason", truncateFailureReason(msg)),
+	)
+	if exitCode, ok := r.exitCodeFromJobPods(ctx, &job); ok {
+		span.SetAttributes(attribute.Int("evalhub.job.exit_code", int(exitCode)))
+	}
+
 	detailForLog := msg
 	if len(detailForLog) > 512 {
 		detailForLog = detailForLog[:512] + "…"
@@ -356,11 +408,13 @@ func (r *EvalHubEvaluationJobFailureReconciler) Reconcile(ctx context.Context, r
 			log.Info("cannot resolve EvalHub URL from job",
 				append(failureWatcherLogFields(), "action", "skip_no_evalhub_url",
 					"job", job.Name, "namespace", job.Namespace, "error", err.Error())...)
+			setJobFailureAction("skip")
 			return ctrl.Result{}, nil
 		}
 		log.Info("cannot resolve EvalHub URL from job",
 			append(failureWatcherLogFields(), "action", "skip_no_evalhub_url",
 				"job", job.Name, "namespace", job.Namespace, "error", err.Error())...)
+		setJobFailureAction("skip")
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
@@ -368,6 +422,7 @@ func (r *EvalHubEvaluationJobFailureReconciler) Reconcile(ctx context.Context, r
 	if jobID == "" {
 		log.Info("skip EvalHub POST: missing job_id label",
 			append(failureWatcherLogFields(), "action", "skip_missing_label", "job", job.Name, "namespace", job.Namespace, "label", evalHubJobIDLabel)...)
+		setJobFailureAction("skip")
 		return ctrl.Result{}, nil
 	}
 
@@ -376,11 +431,16 @@ func (r *EvalHubEvaluationJobFailureReconciler) Reconcile(ctx context.Context, r
 	if providerID == "" || benchmarkID == "" {
 		log.Info("skip EvalHub POST: missing provider_id or benchmark_id label",
 			append(failureWatcherLogFields(), "action", "skip_missing_label", "job", job.Name, "namespace", job.Namespace)...)
+		setJobFailureAction("skip")
 		return ctrl.Result{}, nil
 	}
 
 	benchmarkIndex := benchmarkIndexFromJob(&job)
 
+	setJobFailureAction("post")
+
+	// If failure-pending is already set, the POST succeeded in a prior reconcile but the
+	// promote patch failed. Skip the POST and go straight to the promote patch.
 	if !failurePendingReport(&job) {
 		pendingPatch := client.MergeFrom(job.DeepCopy())
 		if job.Annotations == nil {
@@ -390,37 +450,52 @@ func (r *EvalHubEvaluationJobFailureReconciler) Reconcile(ctx context.Context, r
 		if err := r.Patch(ctx, &job, pendingPatch); err != nil {
 			log.Error(err, "failed to annotate job pending EvalHub failure sync",
 				append(failureWatcherLogFields(), "action", "patch_pending_failed", "job", job.Name)...)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
-	}
 
-	if err := postEvalHubBenchmarkFailed(ctx, r.RESTConfig, baseURL, job.Namespace, jobID, providerID, benchmarkID, benchmarkIndex, msg, ""); err != nil {
-		log.Error(err, "failed to post EvalHub benchmark failure event",
-			append(failureWatcherLogFields(), "action", "post_events_failed", "job", job.Name, "evalJobID", jobID)...)
-		revert := client.MergeFrom(job.DeepCopy())
-		delete(job.Annotations, annotationFailurePending)
-		if len(job.Annotations) == 0 {
-			job.Annotations = nil
+		if err := postEvalHubBenchmarkFailed(ctx, r.RESTConfig, baseURL, job.Namespace, jobID, providerID, benchmarkID, benchmarkIndex, msg, ""); err != nil {
+			log.Error(err, "failed to post EvalHub benchmark failure event",
+				append(failureWatcherLogFields(), "action", "post_events_failed", "job", job.Name, "evalJobID", jobID)...)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			revert := client.MergeFrom(job.DeepCopy())
+			delete(job.Annotations, annotationFailurePending)
+			if len(job.Annotations) == 0 {
+				job.Annotations = nil
+			}
+			if err2 := r.Patch(ctx, &job, revert); err2 != nil {
+				log.Error(err2, "failed to revert failure-pending annotation after POST failure",
+					append(failureWatcherLogFields(), "action", "revert_pending_failed", "job", job.Name)...)
+			}
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
-		if err2 := r.Patch(ctx, &job, revert); err2 != nil {
-			log.Error(err2, "failed to revert failure-pending annotation after POST failure",
-				append(failureWatcherLogFields(), "action", "revert_pending_failed", "job", job.Name)...)
-		}
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		recordJobFailureEvent(msg)
 	}
 
 	promotePatch := client.MergeFrom(job.DeepCopy())
 	if job.Annotations == nil {
 		job.Annotations = map[string]string{}
 	}
+	if job.Labels == nil {
+		job.Labels = map[string]string{}
+	}
 	delete(job.Annotations, annotationFailurePending)
 	job.Annotations[annotationFailureReported] = "true"
+	job.Annotations[annotationEvaluationStatus] = msg
+	job.Labels[labelEvaluationPhase] = labelEvaluationPhaseFailed
 	if err := r.Patch(ctx, &job, promotePatch); err != nil {
 		log.Error(err, "failed to promote failure-reported annotation after successful POST",
 			append(failureWatcherLogFields(), "action", "promote_reported_failed", "job", job.Name)...)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
+	r.EventRecorder.Eventf(&job, corev1.EventTypeWarning, eventReasonEvaluationFailed, "%s", msg)
+
+	setJobFailureAction("delete")
 	if err := r.deleteEvalHubFailureSyncedJob(ctx, &job); err != nil {
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
@@ -463,6 +538,62 @@ func (r *EvalHubEvaluationJobFailureReconciler) detectFailure(ctx context.Contex
 		return true, msg, nil
 	}
 	return false, "", nil
+}
+
+func (r *EvalHubEvaluationJobFailureReconciler) exitCodeFromJobPods(ctx context.Context, job *batchv1.Job) (int32, bool) {
+	list := &corev1.PodList{}
+	if err := r.List(ctx, list, client.InNamespace(job.Namespace), client.MatchingLabels{
+		"batch.kubernetes.io/job-name": job.Name,
+	}); err != nil {
+		return 0, false
+	}
+	for i := range list.Items {
+		pod := &list.Items[i]
+		ownedByJob := false
+		for _, ref := range pod.OwnerReferences {
+			if ref.Kind == "Job" && ref.UID == job.UID {
+				ownedByJob = true
+				break
+			}
+		}
+		if !ownedByJob {
+			continue
+		}
+		if code, ok := exitCodeFromPod(pod); ok {
+			return code, true
+		}
+	}
+	return 0, false
+}
+
+func exitCodeFromPod(pod *corev1.Pod) (int32, bool) {
+	if code, ok := terminatedExitCodeFromContainerStatuses(pod.Status.InitContainerStatuses, initContainerName, true); ok {
+		return code, true
+	}
+	if code, ok := terminatedExitCodeFromContainerStatuses(pod.Status.ContainerStatuses, adapterContainerName, false); ok {
+		return code, true
+	}
+	if code, ok := terminatedExitCodeFromContainerStatuses(pod.Status.ContainerStatuses, sidecarContainerName, true); ok {
+		return code, true
+	}
+	return 0, false
+}
+
+func terminatedExitCodeFromContainerStatuses(statuses []corev1.ContainerStatus, containerName string, initOrSidecar bool) (int32, bool) {
+	for _, cs := range statuses {
+		if cs.Name != containerName || cs.State.Terminated == nil {
+			continue
+		}
+		t := cs.State.Terminated
+		needReport := terminatedInitOrSidecarNeedsOperatorReport(t)
+		if !initOrSidecar {
+			needReport = terminatedAdapterNeedsOperatorReport(t)
+		}
+		if needReport && t.ExitCode != 0 {
+			return t.ExitCode, true
+		}
+	}
+	return 0, false
 }
 
 func (r *EvalHubEvaluationJobFailureReconciler) operatorOnlyFailureFromPods(ctx context.Context, job *batchv1.Job) (string, bool, error) {
@@ -727,6 +858,16 @@ func failureAlreadyReported(job *batchv1.Job) bool {
 		return false
 	}
 	return job.Annotations[annotationFailureReported] == "true"
+}
+
+// serverAlreadyHandledFailure returns true when the EvalHub server has already set evaluation-phase=Failed
+// on the Job, indicating the server reported the failure via its own event path. Prevents duplicate
+// Events when both the server and operator can detect the same failure.
+func serverAlreadyHandledFailure(job *batchv1.Job) bool {
+	if job.Labels == nil {
+		return false
+	}
+	return job.Labels[labelEvaluationPhase] == labelEvaluationPhaseFailed
 }
 
 func failurePendingReport(job *batchv1.Job) bool {

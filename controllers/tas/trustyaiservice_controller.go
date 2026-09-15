@@ -39,9 +39,20 @@ import (
 
 var ErrPVCNotReady = goerrors.New("PVC is not ready")
 
+// crdReader returns an uncached reader for one-off CRD-existence checks, avoiding
+// the manager cache's informer-sync race on first access to a not-yet-watched GVK.
+// Falls back to Client if APIReader is unset (e.g. unit tests using a fake client).
+func (r *TrustyAIServiceReconciler) crdReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
 func ControllerSetUp(mgr manager.Manager, ns, configmap string, recorder record.EventRecorder) error {
 	return (&TrustyAIServiceReconciler{
 		Client:        mgr.GetClient(),
+		APIReader:     mgr.GetAPIReader(),
 		Scheme:        mgr.GetScheme(),
 		Namespace:     ns,
 		EventRecorder: recorder,
@@ -51,6 +62,11 @@ func ControllerSetUp(mgr manager.Manager, ns, configmap string, recorder record.
 // TrustyAIServiceReconciler reconciles a TrustyAIService object
 type TrustyAIServiceReconciler struct {
 	client.Client
+	// APIReader is an uncached client used for one-off existence checks (e.g. optional
+	// CRD presence) that must not be affected by the manager cache's informer-sync race
+	// on first access to a not-yet-watched GVK. Falls back to Client if unset (e.g. in
+	// tests that don't wire it up).
+	APIReader     client.Reader
 	Scheme        *runtime.Scheme
 	Namespace     string
 	EventRecorder record.EventRecorder
@@ -75,6 +91,8 @@ type TrustyAIServiceReconciler struct {
 //+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;delete
 //+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=get;list;watch;create;update;delete
+//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;delete
+//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;delete
 //+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;create;update
 //+kubebuilder:rbac:groups=networking.istio.io,resources=destinationrules,verbs=create;list;watch;get;update;patch;delete
 //+kubebuilder:rbac:groups=networking.istio.io,resources=virtualservices,verbs=create;list;watch;get;update;patch;delete
@@ -234,6 +252,24 @@ func (r *TrustyAIServiceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	err = utils.ReconcileService(ctx, r.Client, instance, internalServiceConfig, serviceTemplatePath, templateParser.ParseResource)
 	if err != nil {
 		// handle error
+		return RequeueWithError(err)
+	}
+
+	// Metrics reader ServiceAccount + token (must exist before ServiceMonitor references it)
+	err = r.ensureMetricsReaderServiceAccount(instance, ctx)
+	if err != nil {
+		return RequeueWithError(err)
+	}
+
+	// Prometheus RBAC for metrics scraping through kube-rbac-proxy
+	err = r.ensurePrometheusRBAC(instance, ctx)
+	if err != nil {
+		return RequeueWithError(err)
+	}
+
+	// Metrics CA bundle ConfigMap (must exist before the local ServiceMonitor references it)
+	err = r.ensureMetricsCABundleConfigMap(instance, ctx)
+	if err != nil {
 		return RequeueWithError(err)
 	}
 
