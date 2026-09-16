@@ -5,6 +5,10 @@ MODULE_DIR         := trustyai-operator-module
 MODULE_TAG         ?= latest
 ENGINE             ?= $(BUILD_TOOL)
 
+.PHONY: sync-trustyai-module-manifests
+sync-trustyai-module-manifests: ## Copy the generated workload manifests into the module image source tree
+	./hack/sync-trustyai-module-manifests.sh
+
 .PHONY: docker-build-tom
 docker-build-tom: ## Build the trustyai-operator-module-controller image
 	$(ENGINE) buildx build \
@@ -46,5 +50,5 @@ precommit-tom: ## Run pre-commit checks for trustyai-operator-module
 	cd $(MODULE_DIR) && go mod tidy && go vet ./... && go build ./...
 
 .PHONY: test-tom
-test-tom: ## Run tests for trustyai-operator-module
-	cd $(MODULE_DIR) && go test ./... -v
+test-tom: envtest ## Run tests for trustyai-operator-module
+	cd $(MODULE_DIR) && KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test ./... -v

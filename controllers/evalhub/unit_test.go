@@ -866,6 +866,129 @@ func TestEvalHubReconciler_cleanupClusterRoleBinding(t *testing.T) {
 
 // TestEvalHubReconciler_reconcileServiceCAConfigMap verifies that the service CA ConfigMap
 // is created when missing and updated with the inject-cabundle annotation when it exists.
+// TestEvalHubReconciler_reconcileMLflowCABundleConfigMap verifies the merged CA bundle
+// combines the ODH trusted CA bundle, the OpenShift service-serving CA, and the optional
+// user-provided CA referenced by spec.mlflow.tls.caBundle so MLFLOW_TRACKING_URI can target
+// either the internal Service hostname or the public Route.
+func TestEvalHubReconciler_reconcileMLflowCABundleConfigMap(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, evalhubv1.AddToScheme(scheme))
+
+	ctx := context.Background()
+	testNamespace := "test-namespace"
+	evalHubName := "test-evalhub"
+
+	newEvalHub := func() *evalhubv1.EvalHub {
+		return &evalhubv1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      evalHubName,
+				Namespace: testNamespace,
+				UID:       "test-uid-123",
+			},
+		}
+	}
+
+	odhCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: odhTrustedCABundleCMName, Namespace: testNamespace},
+		Data:       map[string]string{"ca-bundle.crt": "PUBLIC-CA-PEM"},
+	}
+	svcCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: openshiftServiceCACMName, Namespace: testNamespace},
+		Data:       map[string]string{serviceCACertFile: "SERVICE-CA-PEM"},
+	}
+
+	getBundle := func(t *testing.T, c client.Client) string {
+		t.Helper()
+		cm := &corev1.ConfigMap{}
+		require.NoError(t, c.Get(ctx, types.NamespacedName{Name: evalHubName + mlflowCABundleCMSuffix, Namespace: testNamespace}, cm))
+		return cm.Data[mlflowCABundleFile]
+	}
+
+	t.Run("merges ODH trusted bundle and service-serving CA", func(t *testing.T) {
+		evalHub := newEvalHub()
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(evalHub, odhCM, svcCM).Build()
+		reconciler := &EvalHubReconciler{Client: fakeClient, Scheme: scheme, EventRecorder: record.NewFakeRecorder(10)}
+
+		require.NoError(t, reconciler.reconcileMLflowCABundleConfigMap(ctx, evalHub))
+
+		bundle := getBundle(t, fakeClient)
+		assert.Contains(t, bundle, "PUBLIC-CA-PEM")
+		assert.Contains(t, bundle, "SERVICE-CA-PEM")
+	})
+
+	t.Run("appends optional user-provided CA bundle from spec.mlflow.tls.caBundle", func(t *testing.T) {
+		evalHub := newEvalHub()
+		evalHub.Spec.MLFlow = &evalhubv1.MLFlowSpec{
+			TLS: &evalhubv1.MLFlowTLSSpec{
+				CABundle: &evalhubv1.CABundleReference{Name: "public-route-ca"},
+			},
+		}
+		userCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "public-route-ca", Namespace: testNamespace},
+			Data:       map[string]string{"ca-bundle.crt": "PUBLIC-ROUTE-CA-PEM"},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(evalHub, odhCM, svcCM, userCM).Build()
+		reconciler := &EvalHubReconciler{Client: fakeClient, Scheme: scheme, EventRecorder: record.NewFakeRecorder(10)}
+
+		require.NoError(t, reconciler.reconcileMLflowCABundleConfigMap(ctx, evalHub))
+
+		bundle := getBundle(t, fakeClient)
+		assert.Contains(t, bundle, "SERVICE-CA-PEM")
+		assert.Contains(t, bundle, "PUBLIC-ROUTE-CA-PEM")
+	})
+
+	t.Run("supports a custom key on the user-provided CA bundle", func(t *testing.T) {
+		evalHub := newEvalHub()
+		evalHub.Spec.MLFlow = &evalhubv1.MLFlowSpec{
+			TLS: &evalhubv1.MLFlowTLSSpec{
+				CABundle: &evalhubv1.CABundleReference{Name: "public-route-ca", Key: "tls.crt"},
+			},
+		}
+		userCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "public-route-ca", Namespace: testNamespace},
+			Data:       map[string]string{"tls.crt": "CUSTOM-KEY-CA-PEM"},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(evalHub, svcCM, userCM).Build()
+		reconciler := &EvalHubReconciler{Client: fakeClient, Scheme: scheme, EventRecorder: record.NewFakeRecorder(10)}
+
+		require.NoError(t, reconciler.reconcileMLflowCABundleConfigMap(ctx, evalHub))
+		assert.Contains(t, getBundle(t, fakeClient), "CUSTOM-KEY-CA-PEM")
+	})
+
+	t.Run("errors when the referenced user CA ConfigMap is missing", func(t *testing.T) {
+		evalHub := newEvalHub()
+		evalHub.Spec.MLFlow = &evalhubv1.MLFlowSpec{
+			TLS: &evalhubv1.MLFlowTLSSpec{
+				CABundle: &evalhubv1.CABundleReference{Name: "does-not-exist"},
+			},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(evalHub, svcCM).Build()
+		reconciler := &EvalHubReconciler{Client: fakeClient, Scheme: scheme, EventRecorder: record.NewFakeRecorder(10)}
+
+		err := reconciler.reconcileMLflowCABundleConfigMap(ctx, evalHub)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "does-not-exist")
+	})
+
+	t.Run("regenerates the bundle on subsequent reconciles (rotation)", func(t *testing.T) {
+		evalHub := newEvalHub()
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(evalHub, odhCM, svcCM).Build()
+		reconciler := &EvalHubReconciler{Client: fakeClient, Scheme: scheme, EventRecorder: record.NewFakeRecorder(10)}
+
+		require.NoError(t, reconciler.reconcileMLflowCABundleConfigMap(ctx, evalHub))
+
+		// Rotate the service-serving CA and reconcile again.
+		rotated := &corev1.ConfigMap{}
+		require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Name: openshiftServiceCACMName, Namespace: testNamespace}, rotated))
+		rotated.Data[serviceCACertFile] = "SERVICE-CA-PEM-ROTATED"
+		require.NoError(t, fakeClient.Update(ctx, rotated))
+
+		require.NoError(t, reconciler.reconcileMLflowCABundleConfigMap(ctx, evalHub))
+		assert.Contains(t, getBundle(t, fakeClient), "SERVICE-CA-PEM-ROTATED")
+	})
+}
+
 func TestEvalHubReconciler_reconcileServiceCAConfigMap(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
@@ -1505,8 +1628,8 @@ func TestEvalHubReconciler_reconcileDeployment_WithDB(t *testing.T) {
 		}, deployment)
 		require.NoError(t, err)
 
-		// Should have 5 volumes: evalhub-config, tls, service-ca, mlflow-token, db-secret
-		assert.Len(t, deployment.Spec.Template.Spec.Volumes, 5)
+		// Should have 6 volumes: evalhub-config, tls, service-ca, mlflow-ca-bundle, mlflow-token, db-secret
+		assert.Len(t, deployment.Spec.Template.Spec.Volumes, 6)
 
 		// Find the DB secret volume
 		var dbVolume *corev1.Volume
@@ -1532,7 +1655,7 @@ func TestEvalHubReconciler_reconcileDeployment_WithDB(t *testing.T) {
 			}
 		}
 		require.NotNil(t, container)
-		assert.Len(t, container.VolumeMounts, 4) // evalhub-config + service-ca + mlflow-token + db-secret
+		assert.Len(t, container.VolumeMounts, 5) // evalhub-config + service-ca + mlflow-ca-bundle + mlflow-token + db-secret
 
 		var dbMount *corev1.VolumeMount
 		for i, m := range container.VolumeMounts {
@@ -1793,6 +1916,352 @@ func TestEvalHubReconciler_reconcileProviderConfigMaps(t *testing.T) {
 	})
 }
 
+func TestEvalHubReconciler_reconcileProviderConfigMaps_singleTenancy(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, appsv1.AddToScheme(scheme))
+	require.NoError(t, evalhubv1.AddToScheme(scheme))
+
+	ctx := context.Background()
+	operatorNamespace := "operator-ns"
+	instanceNamespace := "instance-ns"
+	evalHubName := "test-evalhub"
+
+	t.Run("should find tenant-labeled provider in instance namespace for single tenancy", func(t *testing.T) {
+		sourceProvider := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "my-provider-cm",
+				Namespace: instanceNamespace,
+				Labels: map[string]string{
+					providerLabel:     providerTenantValue,
+					providerNameLabel: "testprovider",
+				},
+			},
+			Data: map[string]string{
+				"testprovider.yaml": "id: testprovider\nname: Test Provider\n",
+			},
+		}
+
+		evalHub := &evalhubv1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      evalHubName,
+				Namespace: instanceNamespace,
+			},
+			Spec: evalhubv1.EvalHubSpec{
+				Tenancy:   evalhubv1.TenancySingle,
+				Providers: []string{"testprovider"},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub, sourceProvider).
+			Build()
+
+		reconciler := &EvalHubReconciler{
+			Client:        fakeClient,
+			Scheme:        scheme,
+			Namespace:     operatorNamespace,
+			EventRecorder: record.NewFakeRecorder(10),
+		}
+
+		cmNames, err := reconciler.reconcileProviderConfigMaps(ctx, evalHub)
+		require.NoError(t, err)
+		require.Len(t, cmNames, 1)
+		assert.Equal(t, evalHubName+"-provider-testprovider", cmNames[0])
+
+		copiedCM := &corev1.ConfigMap{}
+		err = fakeClient.Get(ctx, types.NamespacedName{
+			Name:      evalHubName + "-provider-testprovider",
+			Namespace: instanceNamespace,
+		}, copiedCM)
+		require.NoError(t, err)
+		assert.Equal(t, sourceProvider.Data["testprovider.yaml"], copiedCM.Data["testprovider.yaml"])
+	})
+
+	t.Run("should prefer system provider from operator namespace over tenant fallback", func(t *testing.T) {
+		systemProvider := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "trustyai-service-operator-evalhub-provider-testprovider",
+				Namespace: operatorNamespace,
+				Labels: map[string]string{
+					providerLabel:     "system",
+					providerNameLabel: "testprovider",
+				},
+			},
+			Data: map[string]string{
+				"testprovider.yaml": "id: testprovider\nname: System Provider\n",
+			},
+		}
+
+		tenantProvider := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "my-tenant-provider",
+				Namespace: instanceNamespace,
+				Labels: map[string]string{
+					providerLabel:     providerTenantValue,
+					providerNameLabel: "testprovider",
+				},
+			},
+			Data: map[string]string{
+				"testprovider.yaml": "id: testprovider\nname: Tenant Provider\n",
+			},
+		}
+
+		evalHub := &evalhubv1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      evalHubName,
+				Namespace: instanceNamespace,
+			},
+			Spec: evalhubv1.EvalHubSpec{
+				Tenancy:   evalhubv1.TenancySingle,
+				Providers: []string{"testprovider"},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub, systemProvider, tenantProvider).
+			Build()
+
+		reconciler := &EvalHubReconciler{
+			Client:        fakeClient,
+			Scheme:        scheme,
+			Namespace:     operatorNamespace,
+			EventRecorder: record.NewFakeRecorder(10),
+		}
+
+		cmNames, err := reconciler.reconcileProviderConfigMaps(ctx, evalHub)
+		require.NoError(t, err)
+		require.Len(t, cmNames, 1)
+		assert.Equal(t, evalHubName+"-provider-testprovider", cmNames[0])
+
+		copiedCM := &corev1.ConfigMap{}
+		err = fakeClient.Get(ctx, types.NamespacedName{
+			Name:      evalHubName + "-provider-testprovider",
+			Namespace: instanceNamespace,
+		}, copiedCM)
+		require.NoError(t, err)
+		assert.Equal(t, "id: testprovider\nname: System Provider\n", copiedCM.Data["testprovider.yaml"])
+	})
+
+	t.Run("should not find system-labeled provider in instance namespace", func(t *testing.T) {
+		systemLabeledInTenant := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "my-provider-cm",
+				Namespace: instanceNamespace,
+				Labels: map[string]string{
+					providerLabel:     "system",
+					providerNameLabel: "testprovider",
+				},
+			},
+			Data: map[string]string{
+				"testprovider.yaml": "id: testprovider\n",
+			},
+		}
+
+		evalHub := &evalhubv1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      evalHubName,
+				Namespace: instanceNamespace,
+			},
+			Spec: evalhubv1.EvalHubSpec{
+				Tenancy:   evalhubv1.TenancySingle,
+				Providers: []string{"testprovider"},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub, systemLabeledInTenant).
+			Build()
+
+		reconciler := &EvalHubReconciler{
+			Client:        fakeClient,
+			Scheme:        scheme,
+			Namespace:     operatorNamespace,
+			EventRecorder: record.NewFakeRecorder(10),
+		}
+
+		_, err := reconciler.reconcileProviderConfigMaps(ctx, evalHub)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not found")
+	})
+}
+
+func TestEvalHubReconciler_reconcileCollectionConfigMaps_singleTenancy(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, appsv1.AddToScheme(scheme))
+	require.NoError(t, evalhubv1.AddToScheme(scheme))
+
+	ctx := context.Background()
+	operatorNamespace := "operator-ns"
+	instanceNamespace := "instance-ns"
+	evalHubName := "test-evalhub"
+
+	t.Run("should find tenant-labeled collection in instance namespace for single tenancy", func(t *testing.T) {
+		sourceCollection := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "my-collection-cm",
+				Namespace: instanceNamespace,
+				Labels: map[string]string{
+					collectionLabel:     collectionTenantValue,
+					collectionNameLabel: "testcollection",
+				},
+			},
+			Data: map[string]string{
+				"testcollection.yaml": "id: testcollection\nname: Test Collection\n",
+			},
+		}
+
+		evalHub := &evalhubv1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      evalHubName,
+				Namespace: instanceNamespace,
+			},
+			Spec: evalhubv1.EvalHubSpec{
+				Tenancy:     evalhubv1.TenancySingle,
+				Collections: []string{"testcollection"},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub, sourceCollection).
+			Build()
+
+		reconciler := &EvalHubReconciler{
+			Client:        fakeClient,
+			Scheme:        scheme,
+			Namespace:     operatorNamespace,
+			EventRecorder: record.NewFakeRecorder(10),
+		}
+
+		cmNames, err := reconciler.reconcileCollectionConfigMaps(ctx, evalHub)
+		require.NoError(t, err)
+		require.Len(t, cmNames, 1)
+		assert.Equal(t, evalHubName+"-collection-testcollection", cmNames[0])
+
+		copiedCM := &corev1.ConfigMap{}
+		err = fakeClient.Get(ctx, types.NamespacedName{
+			Name:      evalHubName + "-collection-testcollection",
+			Namespace: instanceNamespace,
+		}, copiedCM)
+		require.NoError(t, err)
+		assert.Equal(t, sourceCollection.Data["testcollection.yaml"], copiedCM.Data["testcollection.yaml"])
+	})
+
+	t.Run("should prefer system collection from operator namespace over tenant fallback", func(t *testing.T) {
+		systemCollection := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "trustyai-service-operator-evalhub-collection-testcollection",
+				Namespace: operatorNamespace,
+				Labels: map[string]string{
+					collectionLabel:     "system",
+					collectionNameLabel: "testcollection",
+				},
+			},
+			Data: map[string]string{
+				"testcollection.yaml": "id: testcollection\nname: System Collection\n",
+			},
+		}
+
+		tenantCollection := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "my-tenant-collection",
+				Namespace: instanceNamespace,
+				Labels: map[string]string{
+					collectionLabel:     collectionTenantValue,
+					collectionNameLabel: "testcollection",
+				},
+			},
+			Data: map[string]string{
+				"testcollection.yaml": "id: testcollection\nname: Tenant Collection\n",
+			},
+		}
+
+		evalHub := &evalhubv1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      evalHubName,
+				Namespace: instanceNamespace,
+			},
+			Spec: evalhubv1.EvalHubSpec{
+				Tenancy:     evalhubv1.TenancySingle,
+				Collections: []string{"testcollection"},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub, systemCollection, tenantCollection).
+			Build()
+
+		reconciler := &EvalHubReconciler{
+			Client:        fakeClient,
+			Scheme:        scheme,
+			Namespace:     operatorNamespace,
+			EventRecorder: record.NewFakeRecorder(10),
+		}
+
+		cmNames, err := reconciler.reconcileCollectionConfigMaps(ctx, evalHub)
+		require.NoError(t, err)
+		require.Len(t, cmNames, 1)
+		assert.Equal(t, evalHubName+"-collection-testcollection", cmNames[0])
+
+		copiedCM := &corev1.ConfigMap{}
+		err = fakeClient.Get(ctx, types.NamespacedName{
+			Name:      evalHubName + "-collection-testcollection",
+			Namespace: instanceNamespace,
+		}, copiedCM)
+		require.NoError(t, err)
+		assert.Equal(t, "id: testcollection\nname: System Collection\n", copiedCM.Data["testcollection.yaml"])
+	})
+
+	t.Run("should not find system-labeled collection in instance namespace", func(t *testing.T) {
+		systemLabeledInTenant := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "my-collection-cm",
+				Namespace: instanceNamespace,
+				Labels: map[string]string{
+					collectionLabel:     "system",
+					collectionNameLabel: "testcollection",
+				},
+			},
+			Data: map[string]string{
+				"testcollection.yaml": "id: testcollection\n",
+			},
+		}
+
+		evalHub := &evalhubv1.EvalHub{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      evalHubName,
+				Namespace: instanceNamespace,
+			},
+			Spec: evalhubv1.EvalHubSpec{
+				Tenancy:     evalhubv1.TenancySingle,
+				Collections: []string{"testcollection"},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub, systemLabeledInTenant).
+			Build()
+
+		reconciler := &EvalHubReconciler{
+			Client:        fakeClient,
+			Scheme:        scheme,
+			Namespace:     operatorNamespace,
+			EventRecorder: record.NewFakeRecorder(10),
+		}
+
+		_, err := reconciler.reconcileCollectionConfigMaps(ctx, evalHub)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not found")
+	})
+}
+
 // TestEvalHubReconciler_createTenantServiceCAConfigMap verifies that the service CA
 // ConfigMap is created in tenant namespaces with the inject-cabundle annotation
 // and job resource labels for cleanup.
@@ -1932,6 +2401,88 @@ func TestEvalHubReconciler_createTenantServiceCAConfigMap(t *testing.T) {
 	})
 }
 
+// TestEvalHubReconciler_createTenantMLFlowCABundleConfigMap verifies that the merged
+// MLflow CA bundle is copied from the instance namespace into tenant namespaces so
+// evaluation job sidecars can mount the same trust store as the EvalHub API.
+func TestEvalHubReconciler_createTenantMLFlowCABundleConfigMap(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, evalhubv1.AddToScheme(scheme))
+
+	ctx := context.Background()
+	instanceNamespace := "opendatahub"
+	tenantNamespace := "team-a"
+	evalHubName := "evalhub"
+	cmName := evalHubName + mlflowCABundleCMSuffix
+
+	evalHub := &evalhubv1.EvalHub{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      evalHubName,
+			Namespace: instanceNamespace,
+			UID:       "test-uid-mlflow-ca",
+		},
+	}
+
+	sourceCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cmName,
+			Namespace: instanceNamespace,
+		},
+		Data: map[string]string{mlflowCABundleFile: "MERGED-CA-PEM"},
+	}
+
+	t.Run("copies bundle from instance namespace into tenant namespace", func(t *testing.T) {
+		tenantNS := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: tenantNamespace}}
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub, tenantNS, sourceCM).
+			Build()
+		reconciler := &EvalHubReconciler{Client: fakeClient, Scheme: scheme, EventRecorder: record.NewFakeRecorder(10)}
+
+		require.NoError(t, reconciler.createTenantMLFlowCABundleConfigMap(ctx, evalHub, tenantNamespace))
+
+		cm := &corev1.ConfigMap{}
+		require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Name: cmName, Namespace: tenantNamespace}, cm))
+		assert.Equal(t, "MERGED-CA-PEM", cm.Data[mlflowCABundleFile])
+		assert.Equal(t, "job", cm.Labels["app.kubernetes.io/component"])
+		assert.Empty(t, cm.OwnerReferences)
+	})
+
+	t.Run("updates tenant copy when instance bundle rotates", func(t *testing.T) {
+		tenantNS := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: tenantNamespace}}
+		existing := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: cmName, Namespace: tenantNamespace},
+			Data:       map[string]string{mlflowCABundleFile: "STALE-PEM"},
+		}
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub, tenantNS, sourceCM, existing).
+			Build()
+		reconciler := &EvalHubReconciler{Client: fakeClient, Scheme: scheme, EventRecorder: record.NewFakeRecorder(10)}
+
+		require.NoError(t, reconciler.createTenantMLFlowCABundleConfigMap(ctx, evalHub, tenantNamespace))
+
+		cm := &corev1.ConfigMap{}
+		require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Name: cmName, Namespace: tenantNamespace}, cm))
+		assert.Equal(t, "MERGED-CA-PEM", cm.Data[mlflowCABundleFile])
+	})
+
+	t.Run("skips when instance bundle ConfigMap is missing", func(t *testing.T) {
+		tenantNS := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: tenantNamespace}}
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(evalHub, tenantNS).
+			Build()
+		reconciler := &EvalHubReconciler{Client: fakeClient, Scheme: scheme, EventRecorder: record.NewFakeRecorder(10)}
+
+		require.NoError(t, reconciler.createTenantMLFlowCABundleConfigMap(ctx, evalHub, tenantNamespace))
+
+		cm := &corev1.ConfigMap{}
+		err := fakeClient.Get(ctx, types.NamespacedName{Name: cmName, Namespace: tenantNamespace}, cm)
+		assert.True(t, errors.IsNotFound(err))
+	})
+}
+
 // TestEvalHubReconciler_reconcileTenantNamespaces verifies that tenant namespace
 // reconciliation creates the job SA, RBAC bindings, and service CA ConfigMap.
 func TestEvalHubReconciler_reconcileTenantNamespaces(t *testing.T) {
@@ -1962,10 +2513,17 @@ func TestEvalHubReconciler_reconcileTenantNamespaces(t *testing.T) {
 				},
 			},
 		}
+		mlflowCABundleCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      evalHubName + mlflowCABundleCMSuffix,
+				Namespace: instanceNamespace,
+			},
+			Data: map[string]string{mlflowCABundleFile: "MERGED-CA-PEM"},
+		}
 
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
-			WithObjects(evalHub, tenantNS).
+			WithObjects(evalHub, tenantNS, mlflowCABundleCM).
 			Build()
 
 		reconciler := &EvalHubReconciler{
@@ -1986,6 +2544,31 @@ func TestEvalHubReconciler_reconcileTenantNamespaces(t *testing.T) {
 		}, cm)
 		require.NoError(t, err)
 		assert.Equal(t, "true", cm.Annotations["service.beta.openshift.io/inject-cabundle"])
+
+		// Verify merged MLflow CA bundle was copied into the tenant namespace
+		bundleCM := &corev1.ConfigMap{}
+		err = fakeClient.Get(ctx, types.NamespacedName{
+			Name:      evalHubName + mlflowCABundleCMSuffix,
+			Namespace: tenantNamespace,
+		}, bundleCM)
+		require.NoError(t, err)
+		assert.Equal(t, "MERGED-CA-PEM", bundleCM.Data[mlflowCABundleFile])
+
+		// Verify events RoleBinding was created in the tenant namespace so the
+		// EvalHub server SA can emit Kubernetes Events on lifecycle transitions.
+		eventsRBName := normalizeDNS1123LabelValue(evalHubName + "-" + tenantNamespace + "-events-rb")
+		eventsRB := &rbacv1.RoleBinding{}
+		err = fakeClient.Get(ctx, types.NamespacedName{
+			Name:      eventsRBName,
+			Namespace: tenantNamespace,
+		}, eventsRB)
+		require.NoError(t, err, "events RoleBinding should exist in tenant namespace")
+		assert.Equal(t, "ClusterRole", eventsRB.RoleRef.Kind)
+		assert.Equal(t, evalhubEventsClusterRoleName, eventsRB.RoleRef.Name)
+		require.Len(t, eventsRB.Subjects, 1)
+		assert.Equal(t, "ServiceAccount", eventsRB.Subjects[0].Kind)
+		assert.Equal(t, evalHubName+"-service", eventsRB.Subjects[0].Name)
+		assert.Equal(t, instanceNamespace, eventsRB.Subjects[0].Namespace)
 	})
 
 	t.Run("should skip terminating tenant namespace", func(t *testing.T) {

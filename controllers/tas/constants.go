@@ -70,11 +70,19 @@ const (
 	StatusDBAvailable                     = "DBAvailable"
 )
 
+// prometheusUserWorkloadNamespace is the fixed OpenShift namespace for user workload monitoring.
+const prometheusUserWorkloadNamespace = "openshift-user-workload-monitoring"
+
 // Event reasons
 const (
-	EventReasonPVCCreated                 = "PVCCreated"
-	EventReasonInferenceServiceConfigured = "InferenceServiceConfigured"
-	EventReasonServiceMonitorCreated      = "ServiceMonitorCreated"
+	EventReasonPVCCreated                      = "PVCCreated"
+	EventReasonDeploymentCreated               = "DeploymentCreated"
+	EventReasonInferenceServiceConfigured      = "InferenceServiceConfigured"
+	EventReasonServiceMonitorCreated           = "ServiceMonitorCreated"
+	EventReasonMetricsReaderSACreated          = "MetricsReaderServiceAccountCreated"
+	EventReasonMetricsCABundleConfigMapCreated = "MetricsCABundleConfigMapCreated"
+	EventReasonMetricsRoleCreated              = "MetricsRoleCreated"
+	EventReasonMetricsRoleBindingCreated       = "MetricsRoleBindingCreated"
 )
 
 const (
