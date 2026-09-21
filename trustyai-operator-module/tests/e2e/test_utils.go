@@ -20,6 +20,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -54,24 +55,37 @@ var trustyAIServiceGVK = schema.GroupVersionKind{
 	Kind:    "TrustyAIService",
 }
 
-// prometheusGVK matches dependencies.go's required-dependency check. The live
-// cluster has no Prometheus operator, so the lifecycle test seeds a bare
-// instance via the same minimal CRD fixture used by the envtest suite
-// (tests/crds/monitoring.coreos.com_prometheuses.yaml) to clear that gate -
-// otherwise reconciliation never proceeds far enough to create/delete the
-// DSC ConfigMap this test exercises.
+// prometheusGVK matches the dependency precondition checked by the module.
 var prometheusGVK = schema.GroupVersionKind{
 	Group:   "monitoring.coreos.com",
 	Version: "v1",
 	Kind:    "Prometheus",
 }
 
-func createPrometheusInstance(ctx context.Context, namespace, name string) error {
+// ensurePrometheusInstance reuses a workflow-owned resource when present. It
+// returns true only when this test created the resource, so cleanup cannot
+// delete an object owned by the surrounding test environment.
+func ensurePrometheusInstance(ctx context.Context, namespace, name string) (bool, error) {
 	prom := &unstructured.Unstructured{}
 	prom.SetGroupVersionKind(prometheusGVK)
 	prom.SetName(name)
 	prom.SetNamespace(namespace)
-	return k8sClient.Create(ctx, prom)
+
+	err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, prom)
+	if err == nil {
+		return false, nil
+	}
+	if !errors.IsNotFound(err) {
+		return false, err
+	}
+
+	if err := k8sClient.Create(ctx, prom); err != nil {
+		if errors.IsAlreadyExists(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func deletePrometheusInstance(ctx context.Context, namespace, name string) error {
@@ -144,17 +158,26 @@ func createHealthyTrustyAIService(ctx context.Context, namespace, name string) e
 	if err := k8sClient.Create(ctx, operand); err != nil {
 		return err
 	}
-	status := operand.DeepCopy()
-	if err := unstructured.SetNestedSlice(status.Object, []interface{}{
-		map[string]interface{}{
-			"type":   "Ready",
-			"status": "True",
-			"reason": "Available",
-		},
-	}, "status", "conditions"); err != nil {
-		return err
-	}
-	return k8sClient.Status().Update(ctx, status)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		status := &unstructured.Unstructured{}
+		status.SetGroupVersionKind(trustyAIServiceGVK)
+		if err := k8sClient.Get(ctx, types.NamespacedName{
+			Name:      name,
+			Namespace: namespace,
+		}, status); err != nil {
+			return err
+		}
+		if err := unstructured.SetNestedSlice(status.Object, []interface{}{
+			map[string]interface{}{
+				"type":   "Ready",
+				"status": "True",
+				"reason": "Available",
+			},
+		}, "status", "conditions"); err != nil {
+			return err
+		}
+		return k8sClient.Status().Update(ctx, status)
+	})
 }
 
 func waitForModulePhase(ctx context.Context, phase common.Phase) error {
