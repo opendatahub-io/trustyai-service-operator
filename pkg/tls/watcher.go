@@ -18,10 +18,12 @@ package tls
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"time"
 
 	configv1 "github.com/openshift/api/config/v1"
+	"k8s.io/client-go/dynamic"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -37,29 +39,44 @@ const profileRetryInterval = 5 * time.Second
 
 type ProfileWatcher struct {
 	client.Client
-	lastProfile     *configv1.TLSSecurityProfile
-	onProfileChange func()
+	lastProfile      *configv1.TLSSecurityProfile
+	lastAdherence    string
+	readProfileState func(context.Context) (profileState, error)
+	onProfileChange  func()
 }
 
 func NewProfileWatcher(c client.Client, initialProfile *configv1.TLSSecurityProfile, onProfileChange func()) *ProfileWatcher {
+	return NewProfileWatcherWithAdherence(c, initialProfile, TLSAdherenceNoOpinion, onProfileChange)
+}
+
+// NewProfileWatcherWithAdherence seeds the watcher with the profile and
+// adherence state read from the APIServer during operator bootstrap.
+func NewProfileWatcherWithAdherence(c client.Client, initialProfile *configv1.TLSSecurityProfile, initialAdherence string, onProfileChange func()) *ProfileWatcher {
 	return &ProfileWatcher{
-		Client:          c,
-		lastProfile:     initialProfile,
+		Client:        c,
+		lastProfile:   initialProfile,
+		lastAdherence: initialAdherence,
+		readProfileState: func(ctx context.Context) (profileState, error) {
+			apiServer := &configv1.APIServer{}
+			if err := c.Get(ctx, client.ObjectKey{Name: "cluster"}, apiServer); err != nil {
+				return profileState{}, err
+			}
+			return profileState{profile: apiServer.Spec.TLSSecurityProfile, adherence: initialAdherence}, nil
+		},
 		onProfileChange: onProfileChange,
 	}
 }
 
 func (w *ProfileWatcher) Reconcile(ctx context.Context, _ reconcile.Request) (reconcile.Result, error) {
-	apiServer := &configv1.APIServer{}
-	if err := w.Get(ctx, client.ObjectKey{Name: "cluster"}, apiServer); err != nil {
-		watcherLog.Info("TLS profile fetch did not succeed, retrying", "retryAfter", profileRetryInterval, "error", err)
+	state, err := w.readProfileState(ctx)
+	if err != nil {
+		watcherLog.Info("TLS profile state fetch did not succeed, retrying", "retryAfter", profileRetryInterval, "error", err)
 		return reconcile.Result{RequeueAfter: profileRetryInterval}, nil
 	}
-
-	currentProfile := apiServer.Spec.TLSSecurityProfile
-	if !reflect.DeepEqual(w.lastProfile, currentProfile) {
-		watcherLog.Info("TLS security profile changed, triggering restart")
-		w.lastProfile = currentProfile
+	if !reflect.DeepEqual(w.lastProfile, state.profile) || w.lastAdherence != state.adherence {
+		watcherLog.Info("TLS security profile or adherence changed, triggering operand refresh", "adherence", state.adherence)
+		w.lastProfile = state.profile
+		w.lastAdherence = state.adherence
 		if w.onProfileChange != nil {
 			w.onProfileChange()
 		}
@@ -73,6 +90,13 @@ func (w *ProfileWatcher) NeedLeaderElection() bool {
 }
 
 func (w *ProfileWatcher) SetupWithManager(mgr ctrl.Manager) error {
+	apiClient, err := dynamic.NewForConfig(mgr.GetConfig())
+	if err != nil {
+		return fmt.Errorf("creating dynamic client for TLS profile state: %w", err)
+	}
+	w.readProfileState = func(ctx context.Context) (profileState, error) {
+		return readTLSProfileState(ctx, apiClient)
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("tls-profile-watcher").
 		WithOptions(controller.Options{NeedLeaderElection: boolPtr(false)}).
