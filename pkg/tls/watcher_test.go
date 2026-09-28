@@ -192,6 +192,29 @@ func TestReconcile_CustomProfileChange(t *testing.T) {
 	}
 }
 
+func TestReconcile_AdherenceChange(t *testing.T) {
+	profile := &configv1.TLSSecurityProfile{Type: configv1.TLSProfileIntermediateType}
+	scheme := newTestScheme(t)
+
+	apiServer := newAPIServerWithProfile(profile)
+	apiServer.Name = "cluster"
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(apiServer).Build()
+
+	called := false
+	w := NewProfileWatcher(c, profile, func() { called = true })
+	w.readProfileState = func(context.Context) (profileState, error) {
+		return profileState{profile: profile, adherence: TLSAdherenceStrictAllComponents}, nil
+	}
+
+	mustReconcile(t, w)
+	if !called {
+		t.Error("onProfileChange must be called when TLS adherence changes")
+	}
+	if w.lastAdherence != TLSAdherenceStrictAllComponents {
+		t.Errorf("watcher did not retain the new adherence: %q", w.lastAdherence)
+	}
+}
+
 func TestReconcile_MultipleReconciles(t *testing.T) {
 	profile := &configv1.TLSSecurityProfile{Type: configv1.TLSProfileModernType}
 	scheme := newTestScheme(t)
