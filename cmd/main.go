@@ -144,6 +144,7 @@ func run() int {
 		return 1
 	}
 	tlsOpts := tlsResult.TLSOpts
+	pkgtls.SetProxyTLSArguments(tlsResult.ProxyArgs)
 
 	metricsOpts := server.Options{
 		BindAddress:   metricsAddr,
@@ -238,8 +239,13 @@ func run() int {
 	defer cancel()
 
 	if tlsResult.APIAvailable {
-		watcher := pkgtls.NewProfileWatcher(mgr.GetClient(), tlsResult.ProfileSpec, func() {
-			setupLog.Info("TLS security profile changed, shutting down for restart")
+		// The resolved arguments are shared by every downstream PodSpec builder.
+		// Restarting the manager is the refresh boundary: it causes each owner
+		// to reconcile its existing CRs with the newly resolved value. If the
+		// new strict profile is invalid, startup fails before any Deployment is
+		// updated, preserving the last known-good workload.
+		watcher := pkgtls.NewProfileWatcherWithAdherence(mgr.GetClient(), tlsResult.ProfileSpec, tlsResult.TLSAdherence, func() {
+			setupLog.Info("TLS security profile or adherence changed, restarting for operand refresh")
 			cancel()
 		})
 		if err := watcher.SetupWithManager(mgr); err != nil {
