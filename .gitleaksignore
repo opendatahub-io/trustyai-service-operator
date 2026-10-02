@@ -1,2 +1,5 @@
-# Known false positive: generic-api-key detection on the TLS mount helper.
-f7cb3c7ec00372121ab8c4d46a7424634f29d3b4:controllers/gorch/tls.go:generic-api-key:13
+# Gitleaks ignore file
+# Add false positive fingerprints below (one per line)
+# Format: commit:file:rule-id:line or file:rule-id:line
+#
+# For path-based exclusions, use .gitleaks.toml allowlist instead.
