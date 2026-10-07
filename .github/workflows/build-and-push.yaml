@@ -192,7 +192,7 @@ jobs:
           issue-number: ${{ github.event.pull_request.number }}
           comment-author: "github-actions[bot]"
           body-includes: PR image build and manifest generation completed successfully
-      - uses: peter-evans/create-or-update-comment@v4
+      - uses: peter-evans/create-or-update-comment@v5
         name: Generate/update success message comment
         if: env.BUILD_CONTEXT == 'ci'
         with:
