@@ -6,6 +6,8 @@ import (
 
 	evalhubv1 "github.com/trustyai-explainability/trustyai-service-operator/api/evalhub/v1"
 	"github.com/trustyai-explainability/trustyai-service-operator/controllers/images"
+	"github.com/trustyai-explainability/trustyai-service-operator/controllers/utils"
+	pkgtls "github.com/trustyai-explainability/trustyai-service-operator/pkg/tls"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -42,10 +44,18 @@ func (r *EvalHubReconciler) reconcileDeployment(ctx context.Context, instance *e
 		return err
 	}
 
+	identity, err := evalHubNetworkPolicyIdentity(instance)
+	if err != nil {
+		return err
+	}
+
 	if errors.IsNotFound(getErr) {
 		// Create new Deployment
 		deployment.Spec = desiredSpec
 		if err := controllerutil.SetControllerReference(instance, deployment, r.Scheme); err != nil {
+			return err
+		}
+		if err := utils.LabelOwnedNetworkPolicyDeployment(deployment, r.Scheme, evalHubNetworkPolicyOwner(instance), identity); err != nil {
 			return err
 		}
 		log.Info("Creating Deployment", "name", deployment.Name)
@@ -54,6 +64,9 @@ func (r *EvalHubReconciler) reconcileDeployment(ctx context.Context, instance *e
 		// Update existing Deployment
 		deployment.Spec = desiredSpec
 		if err := controllerutil.SetControllerReference(instance, deployment, r.Scheme); err != nil {
+			return err
+		}
+		if err := utils.LabelOwnedNetworkPolicyDeployment(deployment, r.Scheme, evalHubNetworkPolicyOwner(instance), identity); err != nil {
 			return err
 		}
 		log.Info("Updating Deployment", "name", deployment.Name)
@@ -266,7 +279,7 @@ func (r *EvalHubReconciler) buildDeploymentSpec(ctx context.Context, instance *e
 		Name:            kubeRBACProxyContainerName,
 		Image:           kubeRBACProxyImage,
 		ImagePullPolicy: corev1.PullIfNotPresent,
-		Args: []string{
+		Args: append([]string{
 			"--secure-listen-address=0.0.0.0:" + fmt.Sprintf("%d", servicePort),
 			"--upstream=" + upstreamURL,
 			"--config-file=" + kubeRBACProxyConfigMountPath,
@@ -277,7 +290,7 @@ func (r *EvalHubReconciler) buildDeploymentSpec(ctx context.Context, instance *e
 			"--auth-header-fields-enabled",
 			"--auth-header-user-field-name=X-User",
 			"--v=0",
-		},
+		}, pkgtls.CurrentProxyTLSArguments().Args...),
 		Ports: []corev1.ContainerPort{
 			{
 				Name:          "https",

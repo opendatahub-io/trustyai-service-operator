@@ -31,6 +31,7 @@ rules:
   - events
   verbs:
   - create
+  - list
   - patch
   - update
 - apiGroups:
@@ -255,6 +256,18 @@ rules:
   - update
   - watch
 - apiGroups:
+  - networking.k8s.io
+  resources:
+  - networkpolicies
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - rbac.authorization.k8s.io
   resources:
   - clusterrolebindings
@@ -332,7 +345,6 @@ rules:
   - collections
   - evalhubs
   - evaluations
-  - guardrailsorchestrators
   - lmevaljobs
   - nemoguardrails
   - providers
@@ -374,7 +386,6 @@ rules:
 - apiGroups:
   - trustyai.opendatahub.io
   resources:
-  - guardrailsorchestrators/finalizers
   - nemoguardrails/finalizers
   verbs:
   - get
@@ -384,7 +395,6 @@ rules:
 - apiGroups:
   - trustyai.opendatahub.io
   resources:
-  - guardrailsorchestrators/status
   - nemoguardrails/status
   verbs:
   - get
