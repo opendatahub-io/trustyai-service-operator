@@ -52,10 +52,9 @@ allowed_api_resources := {
 	["config.openshift.io", "apiservers"],
 
 	# --- networking / routes ---
-	["gateway.networking.k8s.io", "gateways"],
-	["mcp.kuadrant.io", "mcpgatewayextensions"],
+	# Per-LMEvalJob execution policy reconciliation and verified legacy cleanup.
+	["networking.k8s.io", "networkpolicies"],
 	["networking.istio.io", "destinationrules"],
-	["networking.istio.io", "envoyfilters"],
 	["networking.istio.io", "virtualservices"],
 	["route.openshift.io", "routes"],
 
@@ -88,9 +87,6 @@ allowed_api_resources := {
 	["trustyai.opendatahub.io", "evalhubs/finalizers"],
 	["trustyai.opendatahub.io", "evalhubs/proxy"],
 	["trustyai.opendatahub.io", "evalhubs/status"],
-	["trustyai.opendatahub.io", "guardrailsorchestrators"],
-	["trustyai.opendatahub.io", "guardrailsorchestrators/finalizers"],
-	["trustyai.opendatahub.io", "guardrailsorchestrators/status"],
 	["trustyai.opendatahub.io", "lmevaljobs"],
 	["trustyai.opendatahub.io", "lmevaljobs/finalizers"],
 	["trustyai.opendatahub.io", "lmevaljobs/status"],
@@ -165,7 +161,6 @@ write_verbs := {"create", "update", "patch", "delete", "deletecollection"}
 
 secrets_write_exempt_suffixes := {
 	"tas-manager-role",
-	"gorch-manager-role",
 	"nemo-guardrails-manager-role",
 	"evalhub-model-secret",
 }

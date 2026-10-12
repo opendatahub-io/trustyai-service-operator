@@ -50,7 +50,6 @@ import (
 
 	evalhubv1 "github.com/trustyai-explainability/trustyai-service-operator/api/evalhub/v1"
 	evalhubv1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/evalhub/v1alpha1"
-	gorchv1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/gorch/v1alpha1"
 	lmesv1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/lmes/v1alpha1"
 	tasv1 "github.com/trustyai-explainability/trustyai-service-operator/api/tas/v1"
 	tasv1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/tas/v1alpha1"
@@ -86,7 +85,6 @@ func init() {
 	utilruntime.Must(routev1.AddToScheme(scheme))
 	utilruntime.Must(apiextensionsv1.AddToScheme(scheme))
 	utilruntime.Must(kueuev1beta1.AddToScheme(scheme))
-	utilruntime.Must(gorchv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(nemoguardrailsv1alpha1.AddToScheme(scheme))
 	//+kubebuilder:scaffold:scheme
 }
@@ -144,6 +142,7 @@ func run() int {
 		return 1
 	}
 	tlsOpts := tlsResult.TLSOpts
+	pkgtls.SetProxyTLSArguments(tlsResult.ProxyArgs)
 
 	metricsOpts := server.Options{
 		BindAddress:   metricsAddr,
@@ -238,8 +237,13 @@ func run() int {
 	defer cancel()
 
 	if tlsResult.APIAvailable {
-		watcher := pkgtls.NewProfileWatcher(mgr.GetClient(), tlsResult.ProfileSpec, func() {
-			setupLog.Info("TLS security profile changed, shutting down for restart")
+		// The resolved arguments are shared by every downstream PodSpec builder.
+		// Restarting the manager is the refresh boundary: it causes each owner
+		// to reconcile its existing CRs with the newly resolved value. If the
+		// new strict profile is invalid, startup fails before any Deployment is
+		// updated, preserving the last known-good workload.
+		watcher := pkgtls.NewProfileWatcherWithAdherence(mgr.GetClient(), tlsResult.ProfileSpec, tlsResult.TLSAdherence, func() {
+			setupLog.Info("TLS security profile or adherence changed, restarting for operand refresh")
 			cancel()
 		})
 		if err := watcher.SetupWithManager(mgr); err != nil {

@@ -21,16 +21,16 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	configv1 "github.com/openshift/api/config/v1"
 	openshifttls "github.com/openshift/controller-runtime-common/pkg/tls"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
-	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var log = ctrl.Log.WithName("tls")
@@ -40,6 +40,47 @@ type Result struct {
 	TLSOpts      []func(*tls.Config)
 	APIAvailable bool
 	ProfileSpec  *configv1.TLSSecurityProfile
+	TLSAdherence string
+	ProxyArgs    ProxyTLSArguments
+}
+
+var proxyArgsState = struct {
+	sync.RWMutex
+	args ProxyTLSArguments
+}{
+	args: ProxyTLSArguments{MinVersion: string(configv1.VersionTLS12), Args: []string{
+		"--tls-min-version=" + string(configv1.VersionTLS12),
+		"--tls-curve-preferences=23,24,25,29",
+	}},
+}
+
+// SetProxyTLSArguments publishes the arguments used by workload builders.
+// Callers must resolve and validate the complete value before publishing it.
+func SetProxyTLSArguments(args ProxyTLSArguments) {
+	proxyArgsState.Lock()
+	defer proxyArgsState.Unlock()
+	proxyArgsState.args = copyProxyTLSArguments(args)
+}
+
+// CurrentProxyTLSArguments returns a copy of the arguments currently used by
+// workload builders.
+func CurrentProxyTLSArguments() ProxyTLSArguments {
+	proxyArgsState.RLock()
+	defer proxyArgsState.RUnlock()
+	return copyProxyTLSArguments(proxyArgsState.args)
+}
+
+func copyProxyTLSArguments(args ProxyTLSArguments) ProxyTLSArguments {
+	args.CipherSuites = append([]string(nil), args.CipherSuites...)
+	args.CurvePreferences = append([]uint16(nil), args.CurvePreferences...)
+	args.Args = append([]string(nil), args.Args...)
+	return args
+}
+
+func init() {
+	if args, err := ResolveProxyTLSArguments(nil, TLSAdherenceNoOpinion, nil, fipsModeEnabled()); err == nil {
+		SetProxyTLSArguments(args)
+	}
 }
 
 // Resolve reads the cluster TLS profile from apiservers.config.openshift.io/cluster
@@ -50,12 +91,7 @@ type Result struct {
 func Resolve(ctx context.Context, cfg *rest.Config) (Result, error) {
 	var result Result
 
-	scheme := runtime.NewScheme()
-	if err := configv1.Install(scheme); err != nil {
-		return result, fmt.Errorf("installing OpenShift config scheme: %w", err)
-	}
-
-	k8sClient, err := client.New(cfg, client.Options{Scheme: scheme})
+	apiClient, err := dynamic.NewForConfig(cfg)
 	if err != nil {
 		return result, fmt.Errorf("creating bootstrap client for TLS profile: %w", err)
 	}
@@ -65,8 +101,8 @@ func Resolve(ctx context.Context, cfg *rest.Config) (Result, error) {
 	fetchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	apiServer := &configv1.APIServer{}
-	if err := k8sClient.Get(fetchCtx, client.ObjectKey{Name: "cluster"}, apiServer); err != nil {
+	state, err := readTLSProfileState(fetchCtx, apiClient)
+	if err != nil {
 		switch {
 		case meta.IsNoMatchError(err):
 			log.Info("TLS profile not available (non-OpenShift cluster)")
@@ -86,13 +122,33 @@ func Resolve(ctx context.Context, cfg *rest.Config) (Result, error) {
 			return result, fmt.Errorf("failed to read APIServer TLS profile: %w", err)
 		}
 		result.TLSOpts, _ = tlsOptsForProfile(nil)
+		if result.APIAvailable {
+			// A transient read failure must not replace a previously published
+			// strict profile with NoOpinion arguments. Keep the last known-good
+			// value until the watcher can confirm the current APIServer state.
+			result.ProxyArgs = CurrentProxyTLSArguments()
+		} else {
+			result.ProxyArgs, _ = ResolveProxyTLSArguments(nil, TLSAdherenceNoOpinion, nil, fipsModeEnabled())
+		}
 		return result, nil //nolint:nilerr // intentional fail-open: use hardened defaults for transient/expected errors
 	}
 
 	result.APIAvailable = true
-	result.ProfileSpec = apiServer.Spec.TLSSecurityProfile
+	result.ProfileSpec = state.profile
+	result.TLSAdherence = state.adherence
 
-	result.TLSOpts, err = tlsOptsForProfile(apiServer.Spec.TLSSecurityProfile)
+	result.TLSOpts, err = tlsOptsForProfile(state.profile)
+	if err != nil {
+		return result, err
+	}
+	// Resolve the APIServer profile and adherence together before publishing
+	// the complete configuration to workload builders.
+	result.ProxyArgs, err = ResolveProxyTLSArguments(
+		state.profile,
+		result.TLSAdherence,
+		nil,
+		fipsModeEnabled(),
+	)
 	if err != nil {
 		return result, err
 	}

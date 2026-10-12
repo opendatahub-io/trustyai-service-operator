@@ -214,9 +214,17 @@ type EvalHubSpec struct {
 
 	// Collections is the list of OOTB collection names to mount into the deployment.
 	// Each name must match a collection-name label on a ConfigMap in the operator namespace.
-	// +kubebuilder:default:={"leaderboard-v2","safety-and-fairness-v1","toxicity-and-ethical-principles"}
+	// +kubebuilder:default:={"leaderboard-v2","safety-and-fairness-v1","toxicity-and-ethical-principles","knowledge-reasoning-v1","document-understanding-v1","instruction-output-v1","tool-use-v1","software-v1","trustworthiness-v1","multimodal-v1"}
 	// +optional
 	Collections []string `json:"collections,omitempty"`
+
+	// CollectionOverrides contains instance-specific overrides for selected system collections.
+	// Each Collection must match an entry in Collections. When CurationOrder is omitted,
+	// the packaged system collection value is retained.
+	// +optional
+	// +listType=map
+	// +listMapKey=collection
+	CollectionOverrides []SystemCollectionOverride `json:"collectionOverrides,omitempty"`
 
 	// Database configuration for persistent storage.
 	// This field is required: the operator will not start the service without
@@ -247,6 +255,21 @@ type EvalHubSpec struct {
 	// +kubebuilder:validation:Enum=single;multi
 	// +optional
 	Tenancy TenancyMode `json:"tenancy,omitempty"`
+}
+
+// SystemCollectionOverride defines the supported instance-specific overrides for
+// an operator-packaged system collection.
+type SystemCollectionOverride struct {
+	// Collection is the stable collection identifier from spec.collections.
+	// +kubebuilder:validation:MinLength=1
+	Collection string `json:"collection"`
+
+	// CurationOrder controls curation priority for this instance. Nil retains the
+	// packaged value, zero explicitly disables curation, and lower positive values
+	// have higher priority.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	CurationOrder *int32 `json:"curationOrder,omitempty"`
 }
 
 // EvalHubStatus defines the observed state of EvalHub
