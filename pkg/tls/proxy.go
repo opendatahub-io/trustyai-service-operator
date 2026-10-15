@@ -75,6 +75,9 @@ func ResolveProxyTLSArguments(profile *configv1.TLSSecurityProfile, adherence st
 	// Go and kube-rbac-proxy cannot restrict TLS 1.3 cipher suites. Do not
 	// accidentally pass the TLS 1.2 list when the profile requires TLS 1.3.
 	if min != tls.VersionTLS13 {
+		if strict && len(spec.Ciphers) == 0 {
+			return ProxyTLSArguments{}, fmt.Errorf("TLS profile has no cipher suites for TLS <= 1.2")
+		}
 		result.CipherSuites = supportedCipherNames(spec.Ciphers, min)
 		if len(spec.Ciphers) > 0 && len(result.CipherSuites) == 0 {
 			return ProxyTLSArguments{}, fmt.Errorf("TLS profile has no supported cipher suites for TLS %s", minVersion)
