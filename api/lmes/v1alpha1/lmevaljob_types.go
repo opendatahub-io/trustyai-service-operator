@@ -419,6 +419,17 @@ type LMEvalPodSpec struct {
 	// Specify the volumes information for the lm-eval and sidecar containers
 	// +optional
 	Volumes []corev1.Volume `json:"volumes,omitempty"`
+	// ResourceClaims declares the DRA claims available to this Pod. Each entry
+	// references a ResourceClaim or ResourceClaimTemplate in the job's namespace.
+	// Containers opt in by referencing the entry's name in resources.claims.
+	// Existing evaluation Pods are not updated when this configuration changes.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:items:XValidation:rule="has(self.resourceClaimName) != has(self.resourceClaimTemplateName)",message="exactly one of resourceClaimName and resourceClaimTemplateName must be set"
+	// +kubebuilder:validation:items:XValidation:rule="!has(self.resourceClaimName) || size(self.resourceClaimName) > 0",message="resourceClaimName must not be empty"
+	// +kubebuilder:validation:items:XValidation:rule="!has(self.resourceClaimTemplateName) || size(self.resourceClaimTemplateName) > 0",message="resourceClaimTemplateName must not be empty"
+	ResourceClaims []corev1.PodResourceClaim `json:"resourceClaims,omitempty"`
 	// Specify extra containers for the lm-eval job
 	// FIXME: aggregate the sidecar containers into the pod
 	// +optional
@@ -445,6 +456,13 @@ func (p *LMEvalPodSpec) GetVolumes() []corev1.Volume {
 		return nil
 	}
 	return p.Volumes
+}
+
+func (p *LMEvalPodSpec) GetResourceClaims() []corev1.PodResourceClaim {
+	if p == nil {
+		return nil
+	}
+	return p.ResourceClaims
 }
 
 func (p *LMEvalPodSpec) GetSideCards() []corev1.Container {
@@ -657,6 +675,14 @@ func (o *Outputs) HasOCI() bool {
 // LMEvalJobStatus defines the observed state of LMEvalJob
 type LMEvalJobStatus struct {
 	// Important: Run "make" to regenerate code after modifying this file
+
+	// Conditions record controller-owned infrastructure readiness independently
+	// of evaluation progress and results. NetworkPolicyReady does not imply CNI
+	// realization or outbound restriction: the compatibility profile is AllowAll.
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
 	// The name of the Pod that runs the evaluation job
 	// +optional

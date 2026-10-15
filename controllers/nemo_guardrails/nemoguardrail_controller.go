@@ -66,9 +66,6 @@ const (
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments/finalizers,verbs=update
-// +kubebuilder:rbac:groups=networking.istio.io,resources=envoyfilters,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=mcp.kuadrant.io,resources=mcpgatewayextensions,verbs=get;list;watch
-// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get;list;watch
 
 func (r *NemoGuardrailsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -103,6 +100,38 @@ func (r *NemoGuardrailsReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, nil
 	}
 
+	// ====== Validate spec.allowedConsumers ============================================================================
+	if errs := validateAllowedConsumers(nemoGuardrails.Spec.AllowedConsumers); len(errs) > 0 {
+		msg := errs.ToAggregate().Error()
+		logger.Error(errs.ToAggregate(), "Invalid spec.allowedConsumers", "name", nemoGuardrails.Name, "namespace", nemoGuardrails.Namespace)
+		if _, updateErr := r.updateStatus(ctx, nemoGuardrails, func(saved *nemoguardrailsv1alpha1.NemoGuardrails) {
+			utils.SetResourceCondition(&saved.Status.Conditions, "AllowedConsumers", invalidAllowedConsumersReason, msg, corev1.ConditionFalse)
+			utils.SetCompleteCondition(&saved.Status.Conditions, corev1.ConditionFalse, utils.ReconcileFailed, msg)
+			saved.Status.Phase = utils.PhaseError
+		}); updateErr != nil {
+			utils.LogErrorUpdating(ctx, updateErr, "NemoGuardrails status", nemoGuardrails.Name, nemoGuardrails.Namespace)
+			return ctrl.Result{}, updateErr
+		}
+		// enforce exposeRoute: false, so an invalid selector cannot leave the server published.
+		if nemoGuardrails.Spec.ExposeRoute != nil && !*nemoGuardrails.Spec.ExposeRoute {
+			if err := utils.DeleteRoute(ctx, r.Client, nemoGuardrails, nemoGuardrails.Name, nemoGuardrails.Namespace); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+	// update status to indicate that the allowed consumers selector is valid
+	if cond := utils.GetStatusCondition(nemoGuardrails.Status.Conditions, "AllowedConsumersReady"); cond == nil || cond.Status != corev1.ConditionTrue || cond.Reason != validAllowedConsumersReason {
+		if _, updateErr := r.updateStatus(ctx, nemoGuardrails, func(saved *nemoguardrailsv1alpha1.NemoGuardrails) {
+			utils.SetResourceCondition(&saved.Status.Conditions, "AllowedConsumers", validAllowedConsumersReason, "allowedConsumers selector is valid", corev1.ConditionTrue)
+			if saved.Status.Phase == utils.PhaseError {
+				saved.Status.Phase = utils.PhaseProgressing
+			}
+		}); updateErr != nil {
+			utils.LogErrorUpdating(ctx, updateErr, "NemoGuardrails status", nemoGuardrails.Name, nemoGuardrails.Namespace)
+			return ctrl.Result{}, updateErr
+		}
+	}
 	// ====== Ensure that old CRs without ExposeRoute are set to ExposeRoute = true ====================================
 	if nemoGuardrails.Spec.ExposeRoute == nil {
 		exposeRouteTrue := true
@@ -133,7 +162,12 @@ func (r *NemoGuardrailsReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// ====== Deploy kube-rbac-proxy configmap if needed ================================================================
 	if utils.RequiresAuth(nemoGuardrails) {
-		_, _, err := utils.ReconcileConfigMap(ctx, r.Client, nemoGuardrails, GetRBACConfigName(*nemoGuardrails), constants.Version, "kube-rbac-proxy-config.tmpl.yaml", templateParser.ParseResource)
+		_, _, err := utils.ReconcileConfigMap(ctx, r.Client, nemoGuardrails, GetRBACConfigName(*nemoGuardrails, false), constants.Version, "kube-rbac-proxy-config.tmpl.yaml", templateParser.ParseResource)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		_, _, err = utils.ReconcileConfigMap(ctx, r.Client, nemoGuardrails, GetRBACConfigName(*nemoGuardrails, true), constants.Version, "kube-rbac-proxy-admin-config.tmpl.yaml", templateParser.ParseResource)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -193,7 +227,7 @@ func (r *NemoGuardrailsReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		Version:      constants.Version,
 		UseAuthProxy: utils.RequiresAuth(nemoGuardrails),
 	}
-	err = utils.ReconcileService(ctx, r.Client, nemoGuardrails, serviceConfig, serviceTemplate, templateParser.ParseResource)
+	err = utils.EnsureService(ctx, r.Client, nemoGuardrails, serviceConfig, serviceTemplate, templateParser.ParseResource)
 	if err != nil {
 		utils.LogErrorReconciling(ctx, err, "service", serviceConfig.Name, serviceConfig.Namespace)
 		return ctrl.Result{}, err
@@ -206,7 +240,7 @@ func (r *NemoGuardrailsReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			termination = utils.Reencrypt
 		}
 		routeConfig := utils.RouteConfig{
-			PortName:    nemoGuardrails.Name, // only one available port in the service, so don't need to specify any port name
+			PortName:    nemoGuardrails.Name,
 			ServiceName: nemoGuardrails.Name,
 			Termination: utils.StringPointer(termination),
 		}
@@ -218,50 +252,7 @@ func (r *NemoGuardrailsReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	} else {
 		err := utils.DeleteRoute(ctx, r.Client, nemoGuardrails, nemoGuardrails.Name, nemoGuardrails.Namespace)
 		if err != nil {
-			return ctrl.Result{}, err
-		}
-	}
 
-	// ====== Conditionally reconcile EnvoyFilter ========================================================================
-	// Auto-discover an MCPGatewayExtension. If the user set
-	// spec.template.pod.mcpGateway, only extensions targeting that gateway
-	// match; otherwise the first extension found is used (zero-config path).
-	// When prerequisites are absent, any previously-created EnvoyFilter is removed.
-	var mcpGatewayCfg *nemoguardrailsv1alpha1.MCPGatewayConfig
-	if nemoGuardrails.Spec.Template != nil &&
-		nemoGuardrails.Spec.Template.Pod != nil {
-		mcpGatewayCfg = nemoGuardrails.Spec.Template.Pod.MCPGateway
-	}
-
-	if mcpGatewayCfg == nil {
-		if err := r.deleteEnvoyFilter(ctx, nemoGuardrails.Namespace); err != nil {
-			logger.Error(err, "failed to clean up EnvoyFilter")
-		}
-	} else {
-		mcpGatewayRef, mcpGatewayStatus := r.discoverMCPGateway(ctx, mcpGatewayCfg.Namespace, mcpGatewayCfg.Name)
-		nemoGuardrails.Status.MCP = mcpGatewayStatus
-		if !mcpGatewayStatus.MCPGatewayFound {
-			if err := r.deleteEnvoyFilter(ctx, mcpGatewayCfg.Namespace); err != nil {
-				logger.Error(err, "failed to clean up EnvoyFilter")
-			}
-			r.flushMCPStatus(ctx, nemoGuardrails)
-			logger.Info("MCP gateway not found, will retry", "error", mcpGatewayStatus.MCPGatewayError)
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-		}
-
-		bbrPluginStatus := r.isBBRPluginPresent(ctx, mcpGatewayRef.Namespace)
-		nemoGuardrails.Status.BBRPlugin = bbrPluginStatus
-		if !bbrPluginStatus.BBRPluginFound {
-			if err := r.deleteEnvoyFilter(ctx, mcpGatewayRef.Namespace); err != nil {
-				logger.Error(err, "failed to clean up EnvoyFilter")
-			}
-			r.flushMCPStatus(ctx, nemoGuardrails)
-			logger.Info("BBR plugin not found, will retry", "error", bbrPluginStatus.BBRPluginError)
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-		}
-
-		if err := r.ensureEnvoyFilter(ctx, nemoGuardrails, mcpGatewayRef.Name, mcpGatewayRef.Namespace); err != nil {
-			utils.LogErrorReconciling(ctx, err, "EnvoyFilter", mcpGatewayRef.Name, mcpGatewayRef.Namespace)
 			return ctrl.Result{}, err
 		}
 	}

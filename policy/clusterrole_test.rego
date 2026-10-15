@@ -31,6 +31,22 @@ test_multiple_resources_one_unknown_denied if {
 	}
 }
 
+test_lmes_execution_networkpolicy_permissions_allowed if {
+	count(deny) == 0 with input as {
+		"kind": "ClusterRole",
+		"metadata": {"name": "trustyai-service-operator-lmes-manager-role"},
+		"rules": [{"apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies"], "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"]}],
+	}
+}
+
+test_unrelated_networking_resource_denied if {
+	count(deny) > 0 with input as {
+		"kind": "ClusterRole",
+		"metadata": {"name": "trustyai-service-operator-lmes-manager-role"},
+		"rules": [{"apiGroups": ["networking.k8s.io"], "resources": ["ingresses"], "verbs": ["create"]}],
+	}
+}
+
 # --- Layer 2: wildcards ---
 
 test_wildcard_verb_denied if {
@@ -90,14 +106,6 @@ test_secrets_write_exempt_tas_manager if {
 		"kind": "ClusterRole",
 		"metadata": {"name": "trustyai-service-operator-tas-manager-role"},
 		"rules": [{"apiGroups": [""], "resources": ["secrets"], "verbs": ["create", "delete"]}],
-	}
-}
-
-test_secrets_write_exempt_gorch_manager if {
-	count(deny) == 0 with input as {
-		"kind": "ClusterRole",
-		"metadata": {"name": "trustyai-service-operator-gorch-manager-role"},
-		"rules": [{"apiGroups": [""], "resources": ["secrets"], "verbs": ["update", "patch"]}],
 	}
 }
 
