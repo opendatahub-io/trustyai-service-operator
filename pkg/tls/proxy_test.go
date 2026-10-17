@@ -65,6 +65,22 @@ func TestResolveProxyTLSArgumentsRejectsStrictProfiles(t *testing.T) {
 	}
 }
 
+func TestResolveProxyTLSArgumentsRejectsEmptyStrictCipherList(t *testing.T) {
+	profile := &configv1.TLSSecurityProfile{Type: configv1.TLSProfileCustomType, Custom: &configv1.CustomTLSProfile{TLSProfileSpec: configv1.TLSProfileSpec{
+		MinTLSVersion: configv1.VersionTLS12,
+	}}}
+	for _, adherence := range []string{TLSAdherenceStrictAllComponents, "FutureValue"} {
+		if _, err := ResolveProxyTLSArguments(profile, adherence, nil, false); err == nil {
+			t.Errorf("ResolveProxyTLSArguments(%q) accepted an empty cipher list", adherence)
+		}
+	}
+	for _, adherence := range []string{TLSAdherenceNoOpinion, TLSAdherenceLegacyAdheringComponentsOnly} {
+		if _, err := ResolveProxyTLSArguments(profile, adherence, nil, false); err != nil {
+			t.Errorf("ResolveProxyTLSArguments(%q) error = %v, want lenient defaults", adherence, err)
+		}
+	}
+}
+
 func TestResolveProxyTLSArgumentsOldProfileRetainsUsableCiphers(t *testing.T) {
 	got, err := ResolveProxyTLSArguments(&configv1.TLSSecurityProfile{Type: configv1.TLSProfileOldType}, TLSAdherenceStrictAllComponents, nil, false)
 	if err != nil {

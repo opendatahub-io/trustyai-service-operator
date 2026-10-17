@@ -243,7 +243,7 @@ func run() int {
 		// new strict profile is invalid, startup fails before any Deployment is
 		// updated, preserving the last known-good workload.
 		watcher := pkgtls.NewProfileWatcherWithAdherence(mgr.GetClient(), tlsResult.ProfileSpec, tlsResult.TLSAdherence, func() {
-			setupLog.Info("TLS security profile or adherence changed, restarting for operand refresh")
+			setupLog.Info("TLS profile state changed or became unreadable, restarting for operand refresh")
 			cancel()
 		})
 		if err := watcher.SetupWithManager(mgr); err != nil {
