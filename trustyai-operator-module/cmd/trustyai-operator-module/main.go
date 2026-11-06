@@ -71,7 +71,7 @@ func main() {
 
 	mgr, err := ctrl.NewManager(config, ctrl.Options{
 		Scheme:                  scheme,
-		Metrics:                 metricsserver.Options{BindAddress: metricsAddr, TLSOpts: tlsResult.TLSOpts},
+		Metrics:                 metricsserver.Options{BindAddress: metricsAddr, SecureServing: true, TLSOpts: tlsResult.TLSOpts},
 		LeaderElection:          enableLeaderElection,
 		LeaderElectionID:        "trustyai-operator-module-controller-manager",
 		LeaderElectionNamespace: namespace,
