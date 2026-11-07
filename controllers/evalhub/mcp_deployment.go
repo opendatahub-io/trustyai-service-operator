@@ -40,6 +40,9 @@ func (r *EvalHubReconciler) reconcileMCPDeployment(ctx context.Context, instance
 	if !instance.Spec.IsMCPEnabled() {
 		return r.deleteMCPResource(ctx, instance, &appsv1.Deployment{}, name)
 	}
+	if err := pkgtls.CurrentProxyTLSArgumentsError(); err != nil {
+		return fmt.Errorf("%s: %w", pkgtls.ProxyTLSProfileUnsupportedMessage, err)
+	}
 
 	log.Info("Reconciling MCP Deployment", "name", name)
 
@@ -70,7 +73,7 @@ func (r *EvalHubReconciler) reconcileMCPDeployment(ctx context.Context, instance
 		if err := controllerutil.SetControllerReference(instance, deployment, r.Scheme); err != nil {
 			return err
 		}
-		if err := utils.LabelOwnedNetworkPolicyDeployment(deployment, r.Scheme, evalHubNetworkPolicyOwner(instance), identity); err != nil {
+		if err := utils.LabelOwnedNetworkPolicyDeployment(deployment, r.Scheme, evalHubNetworkPolicyOwner(instance), identity, utils.SameNamespaceOwnership); err != nil {
 			return err
 		}
 		log.Info("Creating MCP Deployment", "name", name)
@@ -81,7 +84,7 @@ func (r *EvalHubReconciler) reconcileMCPDeployment(ctx context.Context, instance
 	if err := controllerutil.SetControllerReference(instance, deployment, r.Scheme); err != nil {
 		return err
 	}
-	if err := utils.LabelOwnedNetworkPolicyDeployment(deployment, r.Scheme, evalHubNetworkPolicyOwner(instance), identity); err != nil {
+	if err := utils.LabelOwnedNetworkPolicyDeployment(deployment, r.Scheme, evalHubNetworkPolicyOwner(instance), identity, utils.SameNamespaceOwnership); err != nil {
 		return err
 	}
 	log.Info("Updating MCP Deployment", "name", name)

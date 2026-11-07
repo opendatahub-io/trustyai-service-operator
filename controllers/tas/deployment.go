@@ -52,6 +52,9 @@ type DeploymentConfig struct {
 
 // createDeploymentObject returns a Deployment for the TrustyAI Service instance
 func (r *TrustyAIServiceReconciler) createDeploymentObject(ctx context.Context, instance *trustyaiopendatahubiov1.TrustyAIService, serviceImage string, caBunble CustomCertificatesBundle) (*appsv1.Deployment, error) {
+	if err := pkgtls.CurrentProxyTLSArgumentsError(); err != nil {
+		return nil, fmt.Errorf("%s: %w", pkgtls.ProxyTLSProfileUnsupportedMessage, err)
+	}
 	var batchSize int
 	// If no batch size is provided, assume the default one
 	if instance.Spec.Metrics.BatchSize == nil {
@@ -116,7 +119,7 @@ func (r *TrustyAIServiceReconciler) createDeploymentObject(ctx context.Context, 
 	if err != nil {
 		return nil, err
 	}
-	if err := utils.LabelOwnedNetworkPolicyDeployment(deployment, r.Scheme, instance, identity); err != nil {
+	if err := utils.LabelOwnedNetworkPolicyDeployment(deployment, r.Scheme, instance, identity, utils.SameNamespaceOwnership); err != nil {
 		return nil, fmt.Errorf("stamping NetworkPolicy identity on TAS Deployment: %w", err)
 	}
 	return deployment, nil
