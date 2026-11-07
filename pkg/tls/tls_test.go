@@ -21,12 +21,14 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"slices"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -50,7 +52,7 @@ func TestResolveDegradesOnTransientAPIServerFailure(t *testing.T) {
 		t.Fatalf("ResolveProxyTLSArguments() returned unexpected error: %v", err)
 	}
 	previous := CurrentProxyTLSArguments()
-	defer SetProxyTLSArguments(previous)
+	defer SetProxyTLSArguments(previous, nil)
 	for _, tt := range []struct {
 		name string
 		args ProxyTLSArguments
@@ -59,7 +61,7 @@ func TestResolveDegradesOnTransientAPIServerFailure(t *testing.T) {
 		{name: "previously published strict policy", args: lastKnownGood},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			SetProxyTLSArguments(tt.args)
+			SetProxyTLSArguments(tt.args, nil)
 			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 			defer cancel()
 			result, err := Resolve(ctx, &rest.Config{Host: server.URL})
@@ -157,6 +159,28 @@ func TestReadTLSProfileStateDoesNotRetryPermanentErrors(t *testing.T) {
 		if !errors.Is(err, permanent) || attempts != 1 {
 			t.Fatalf("permanent error %v: attempts=%d err=%v", permanent, attempts, err)
 		}
+	}
+}
+
+func TestIsTransientTLSReadError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "internal server error", err: apierrors.NewInternalError(errors.New("internal error")), want: true},
+		{name: "connection refused", err: &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}, want: true},
+		{name: "forbidden", err: apierrors.NewForbidden(schema.GroupResource{Resource: "apiservers"}, "cluster", errors.New("denied")), want: false},
+		{name: "bad request (unexpected API status)", err: apierrors.NewBadRequest("invalid request"), want: false},
+		{name: "invalid (unexpected API status)", err: apierrors.NewInvalid(schema.GroupKind{Group: "config.openshift.io", Kind: "APIServer"}, "cluster", nil), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isTransientTLSReadError(tt.err); got != tt.want {
+				t.Errorf("isTransientTLSReadError(%v) = %t, want %t", tt.err, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -555,5 +579,56 @@ func TestResolveRejectsUnauthorizedAPIServerReads(t *testing.T) {
 				t.Errorf("Resolve() returned fallback TLS options after authorization failure: %v", result.TLSOpts)
 			}
 		})
+	}
+}
+
+func TestResolveDefersUnservableProxyProfileToReconcile(t *testing.T) {
+	// A Strict profile whose TLS 1.2 cipher list cannot serve HTTP/2 must not
+	// prevent the operator from starting: Resolve defers the failure so the
+	// reconcilers surface it on the affected resources.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"apiVersion":"config.openshift.io/v1","kind":"APIServer","metadata":{"name":"cluster"},"spec":{"tlsSecurityProfile":{"type":"Custom","custom":{"minTLSVersion":"VersionTLS12","ciphers":["ECDHE-RSA-AES256-GCM-SHA384"]}},"tlsAdherence":"StrictAllComponents"}}`))
+	}))
+	defer server.Close()
+
+	result, err := Resolve(context.Background(), &rest.Config{Host: server.URL})
+	if err != nil {
+		t.Fatalf("Resolve() must not fail for a profile the proxies cannot serve: %v", err)
+	}
+	if result.ProxyArgsErr == nil {
+		t.Fatal("ProxyArgsErr must carry the deferred proxy validation failure")
+	}
+	if !strings.Contains(result.ProxyArgsErr.Error(), "cannot serve HTTP/2") {
+		t.Fatalf("ProxyArgsErr = %v, want the HTTP/2 cipher rejection", result.ProxyArgsErr)
+	}
+	if !reflect.DeepEqual(result.ProxyArgs, ProxyTLSArguments{}) {
+		t.Fatalf("ProxyArgs = %#v, want the zero value alongside the deferred error", result.ProxyArgs)
+	}
+	// The operator's own listener options still resolve.
+	if len(result.TLSOpts) == 0 {
+		t.Fatal("TLSOpts must still be populated for the operator's own listeners")
+	}
+}
+
+func TestSetProxyTLSArgumentsPublishesDeferredError(t *testing.T) {
+	previous, previousErr := CurrentProxyTLSArguments(), CurrentProxyTLSArgumentsError()
+	t.Cleanup(func() { SetProxyTLSArguments(previous, previousErr) })
+
+	SetProxyTLSArguments(ProxyTLSArguments{Args: []string{"--tls-min-version=VersionTLS12"}}, nil)
+	if got := CurrentProxyTLSArgumentsError(); got != nil {
+		t.Fatalf("CurrentProxyTLSArgumentsError() = %v, want nil", got)
+	}
+	if len(CurrentProxyTLSArguments().Args) != 1 {
+		t.Fatal("published arguments must be readable when no error is set")
+	}
+
+	wantErr := errors.New("cannot serve HTTP/2")
+	SetProxyTLSArguments(ProxyTLSArguments{}, wantErr)
+	if got := CurrentProxyTLSArgumentsError(); !errors.Is(got, wantErr) {
+		t.Fatalf("CurrentProxyTLSArgumentsError() = %v, want %v", got, wantErr)
+	}
+	if !reflect.DeepEqual(CurrentProxyTLSArguments(), ProxyTLSArguments{}) {
+		t.Fatal("arguments must be cleared when an error is published")
 	}
 }
