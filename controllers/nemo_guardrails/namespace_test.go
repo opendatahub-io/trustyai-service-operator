@@ -2,7 +2,8 @@ package nemo_guardrails
 
 import (
 	"context"
-	"strings"
+	"errors"
+	"reflect"
 	"testing"
 
 	routev1 "github.com/openshift/api/route/v1"
@@ -11,8 +12,10 @@ import (
 	nemoguardrailsv1alpha1 "github.com/trustyai-explainability/trustyai-service-operator/api/nemo_guardrails/v1alpha1"
 	"github.com/trustyai-explainability/trustyai-service-operator/controllers/constants"
 	"github.com/trustyai-explainability/trustyai-service-operator/controllers/utils"
+	pkgtls "github.com/trustyai-explainability/trustyai-service-operator/pkg/tls"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -23,16 +26,61 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
+func TestRewriteResourceRefs(t *testing.T) {
+	cr := &nemoguardrailsv1alpha1.NemoGuardrails{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "nemo-guardrails",
+			Namespace: "source-ns",
+		},
+		Spec: nemoguardrailsv1alpha1.NemoGuardrailsSpec{
+			Env: []corev1.EnvVar{
+				{
+					Name: "SECRET_VALUE",
+					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "credentials"},
+						Key:                  "token",
+					}},
+				},
+				{
+					Name: "CONFIG_VALUE",
+					ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "settings"},
+						Key:                  "endpoint",
+					}},
+				},
+				{Name: "PLAIN_VALUE", Value: "unchanged"},
+			},
+		},
+	}
+
+	got := rewriteResourceRefs(cr, "infra-ns")
+	require.Len(t, got, 3)
+	require.Equal(t, "source-ns-nemo-guardrails-credentials", got[0].ValueFrom.SecretKeyRef.Name)
+	require.Equal(t, "token", got[0].ValueFrom.SecretKeyRef.Key)
+	require.Equal(t, "source-ns-nemo-guardrails-settings", got[1].ValueFrom.ConfigMapKeyRef.Name)
+	require.Equal(t, "endpoint", got[1].ValueFrom.ConfigMapKeyRef.Key)
+	require.Equal(t, corev1.EnvVar{Name: "PLAIN_VALUE", Value: "unchanged"}, got[2])
+
+	// Rewriting the returned environment must not mutate the custom resource's spec.
+	require.Equal(t, "credentials", cr.Spec.Env[0].ValueFrom.SecretKeyRef.Name)
+	require.Equal(t, "settings", cr.Spec.Env[1].ValueFrom.ConfigMapKeyRef.Name)
+}
+
 func TestDeriveInfraNamespace(t *testing.T) {
-	require.Equal(t, "redhat-ai-gateway-infra", deriveInfraNamespace("redhat-ods-applications", "my-cr-ns"))
-	require.Equal(t, "odh-ai-gateway-infra", deriveInfraNamespace("opendatahub", "my-cr-ns"))
-	require.Equal(t, "my-cr-ns", deriveInfraNamespace("some-custom-namespace", "my-cr-ns"))
+	require.Equal(t, "redhat-ai-gateway-infra", deriveInfraNamespace("redhat-ods-applications", "my-cr-ns", true))
+	require.Equal(t, "odh-ai-gateway-infra", deriveInfraNamespace("opendatahub", "my-cr-ns", true))
+	require.Equal(t, "my-cr-ns", deriveInfraNamespace("some-custom-namespace", "my-cr-ns", true))
+
+	// if not in AIGatewayMode, use CR namespace
+	require.Equal(t, "my-cr-ns", deriveInfraNamespace("redhat-ods-applications", "my-cr-ns", false))
 }
 
 func TestCreateDeploymentUsesCRNamespaceOnUnknownPlatform(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, appsv1.AddToScheme(scheme))
+	// The shared NetworkPolicy helpers resolve the owner GVK from the scheme.
+	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
 	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
 
 	cr := &nemoguardrailsv1alpha1.NemoGuardrails{
@@ -74,10 +122,12 @@ func TestCreateDeploymentUsesCRNamespaceOnUnknownPlatform(t *testing.T) {
 	require.Equal(t, "true", source.Labels["nemo-guardrails-config"])
 }
 
-func TestCreateDeploymentCentralizesIntoPlatformInfraNamespace(t *testing.T) {
+func TestCreateDeploymentCentralizesIntoPlatformInfraNamespaceInAIGatewayMode(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, appsv1.AddToScheme(scheme))
+	// The shared NetworkPolicy helpers resolve the owner GVK from the scheme.
+	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
 
 	cr := &nemoguardrailsv1alpha1.NemoGuardrails{
 		ObjectMeta: metav1.ObjectMeta{
@@ -90,6 +140,7 @@ func TestCreateDeploymentCentralizesIntoPlatformInfraNamespace(t *testing.T) {
 				Name:       "nemo-config",
 				ConfigMaps: []string{"nemo-config"},
 			}},
+			AIGatewayMode: true,
 		},
 	}
 	operatorConfig := &corev1.ConfigMap{
@@ -123,11 +174,146 @@ func TestCreateDeploymentCentralizesIntoPlatformInfraNamespace(t *testing.T) {
 	require.Equal(t, "true", source.Labels["nemo-guardrails-config"])
 }
 
+func TestCreateDeploymentRewritesEnvValueFromRefsForInfraNamespace(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, appsv1.AddToScheme(scheme))
+	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
+
+	cr := &nemoguardrailsv1alpha1.NemoGuardrails{
+		ObjectMeta: metav1.ObjectMeta{Name: "nemo-guardrails", Namespace: "test-ns", UID: "cr-uid"},
+		Spec: nemoguardrailsv1alpha1.NemoGuardrailsSpec{
+			NemoConfigs: []nemoguardrailsv1alpha1.NemoConfig{{
+				Name:       "settings",
+				ConfigMaps: []string{"env-settings"},
+			}},
+			Env: []corev1.EnvVar{
+				{
+					Name: "SECRET_TOKEN",
+					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "credentials"},
+						Key:                  "token",
+					}},
+				},
+				{
+					Name: "CONFIG_ENDPOINT",
+					ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "env-settings"},
+						Key:                  "endpoint",
+					}},
+				},
+			},
+			AIGatewayMode: true,
+		},
+	}
+	operatorConfig := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: constants.ConfigMap, Namespace: "redhat-ods-applications"},
+		Data:       map[string]string{nemoGuardrailsImageKey: "quay.io/trustyai/nemo-guardrails:test"},
+	}
+	envConfig := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-settings", Namespace: "test-ns"},
+		Data:       map[string]string{"endpoint": "https://example.test"},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "test-ns"},
+		Data:       map[string][]byte{"token": []byte("secret-token")},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorConfig, envConfig, secret).Build()
+	reconciler := &NemoGuardrailsReconciler{Client: c, Scheme: scheme, Namespace: "redhat-ods-applications"}
+	targetNamespace := "redhat-ai-gateway-infra"
+
+	// Reconciliation copies the referenced Secret before it builds the Deployment.
+	require.NoError(t, reconciler.ensureReferencedSecretsInNamespace(ctx, cr, targetNamespace))
+	deployment, err := reconciler.createDeployment(ctx, cr, utils.CABundleInitContainerConfig{}, nil)
+	require.NoError(t, err)
+	require.Equal(t, targetNamespace, deployment.Namespace)
+	require.Equal(t, "test-ns-nemo-guardrails", deployment.Name)
+	require.NoError(t, c.Create(ctx, deployment))
+
+	created := &appsv1.Deployment{}
+	require.NoError(t, c.Get(ctx, types.NamespacedName{Name: deployment.Name, Namespace: targetNamespace}, created))
+	container := created.Spec.Template.Spec.Containers[0]
+	envByName := make(map[string]corev1.EnvVar, len(container.Env))
+	for _, variable := range container.Env {
+		envByName[variable.Name] = variable
+	}
+	secretEnv := envByName["SECRET_TOKEN"]
+	require.NotNil(t, secretEnv.ValueFrom)
+	require.Equal(t, "test-ns-nemo-guardrails-credentials", secretEnv.ValueFrom.SecretKeyRef.Name)
+	require.Equal(t, "token", secretEnv.ValueFrom.SecretKeyRef.Key)
+	configEnv := envByName["CONFIG_ENDPOINT"]
+	require.NotNil(t, configEnv.ValueFrom)
+	require.Equal(t, "test-ns-nemo-guardrails-env-settings", configEnv.ValueFrom.ConfigMapKeyRef.Name)
+	require.Equal(t, "endpoint", configEnv.ValueFrom.ConfigMapKeyRef.Key)
+
+	copiedSecret := &corev1.Secret{}
+	require.NoError(t, c.Get(ctx, types.NamespacedName{Name: "test-ns-nemo-guardrails-credentials", Namespace: targetNamespace}, copiedSecret))
+	require.Equal(t, []byte("secret-token"), copiedSecret.Data["token"])
+	copiedConfig := &corev1.ConfigMap{}
+	require.NoError(t, c.Get(ctx, types.NamespacedName{Name: "test-ns-nemo-guardrails-env-settings", Namespace: targetNamespace}, copiedConfig))
+	require.Equal(t, "https://example.test", copiedConfig.Data["endpoint"])
+}
+
+func TestCreateDeploymentDoesNotCentralizeIntoPlatformInfraNamespace(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, appsv1.AddToScheme(scheme))
+	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
+
+	cr := &nemoguardrailsv1alpha1.NemoGuardrails{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "nemo-guardrails",
+			Namespace: "test-ns",
+			UID:       "cr-uid",
+		},
+		Spec: nemoguardrailsv1alpha1.NemoGuardrailsSpec{
+			NemoConfigs: []nemoguardrailsv1alpha1.NemoConfig{{
+				Name:       "nemo-config",
+				ConfigMaps: []string{"nemo-config"},
+			}},
+			AIGatewayMode: false,
+		},
+	}
+	operatorConfig := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: constants.ConfigMap, Namespace: "redhat-ods-applications"},
+		Data:       map[string]string{nemoGuardrailsImageKey: "quay.io/trustyai/nemo-guardrails:test"},
+	}
+	userConfig := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "nemo-config", Namespace: "test-ns"},
+		Data:       map[string]string{"config.yaml": "models: []"},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorConfig, userConfig).Build()
+	// The controller runs in the known RHOAI install namespace so the workload
+	// should be centralized into the shared AI Gateway infra namespace.
+	reconciler := &NemoGuardrailsReconciler{Client: c, Scheme: scheme, Namespace: "redhat-ods-applications"}
+
+	deployment, err := reconciler.createDeployment(context.Background(), cr, utils.CABundleInitContainerConfig{}, nil)
+	require.NoError(t, err)
+	require.Equal(t, "test-ns", deployment.Namespace)
+	require.Equal(t, "nemo-guardrails", deployment.Name)
+	require.Equal(t, "nemo-guardrails", deployment.Spec.Selector.MatchLabels["app"])
+	require.Equal(t, "nemo-guardrails", deployment.Spec.Template.Labels["app"])
+	require.Equal(t, types.UID("cr-uid"), deployment.OwnerReferences[0].UID)
+	require.Equal(t, "cr-uid", deployment.Labels[utils.OwnerUIDLabel])
+
+	copied := &corev1.ConfigMap{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "nemo-config", Namespace: "test-ns"}, copied))
+	require.Equal(t, "models: []", copied.Data["config.yaml"])
+
+	source := &corev1.ConfigMap{}
+	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(userConfig), source))
+	require.Equal(t, "true", source.Labels["nemo-guardrails-config"])
+}
+
 func TestEnsureConfigMapDoesNotReplaceUnownedConfigMap(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
 	cr := &nemoguardrailsv1alpha1.NemoGuardrails{
 		ObjectMeta: metav1.ObjectMeta{Name: "nemo-guardrails", Namespace: "control-plane", UID: "cr-uid"},
+		Spec: nemoguardrailsv1alpha1.NemoGuardrailsSpec{
+			AIGatewayMode: true,
+		},
 	}
 	existing := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: "control-plane-nemo-guardrails-nemo-config", Namespace: "models"},
@@ -176,7 +362,10 @@ func TestReleasePreviousWorkloadKeepsOldNamespaceOnCollision(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, appsv1.AddToScheme(scheme))
+	// The shared NetworkPolicy helpers resolve the owner GVK from the scheme.
+	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
 	require.NoError(t, routev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
 	expose := true
 	cr := &nemoguardrailsv1alpha1.NemoGuardrails{
 		ObjectMeta: metav1.ObjectMeta{
@@ -212,7 +401,10 @@ func TestReleasePreviousWorkloadKeepsOldNamespaceOnConfigMapCollision(t *testing
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, appsv1.AddToScheme(scheme))
+	// The shared NetworkPolicy helpers resolve the owner GVK from the scheme.
+	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
 	require.NoError(t, routev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
 	defaultName := nemoGuardrailsDefaultConfigPrefix + "-rails"
 	cr := &nemoguardrailsv1alpha1.NemoGuardrails{
 		ObjectMeta: metav1.ObjectMeta{Name: "nemo-guardrails", Namespace: "control-plane", UID: "cr-uid"},
@@ -251,7 +443,10 @@ func TestReleasePreviousWorkloadKeepsOldNamespaceOnSecretCollision(t *testing.T)
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, appsv1.AddToScheme(scheme))
+	// The shared NetworkPolicy helpers resolve the owner GVK from the scheme.
+	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
 	require.NoError(t, routev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
 	cr := &nemoguardrailsv1alpha1.NemoGuardrails{
 		ObjectMeta: metav1.ObjectMeta{Name: "nemo-guardrails", Namespace: "control-plane", UID: "cr-uid"},
 		Spec: nemoguardrailsv1alpha1.NemoGuardrailsSpec{
@@ -281,7 +476,10 @@ func TestReleaseReadyWorkloadKeepsPreviousUntilReady(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, appsv1.AddToScheme(scheme))
+	// The shared NetworkPolicy helpers resolve the owner GVK from the scheme.
+	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
 	require.NoError(t, routev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
 	cr := &nemoguardrailsv1alpha1.NemoGuardrails{
 		ObjectMeta: metav1.ObjectMeta{Name: "nemo-guardrails", Namespace: "control-plane", UID: "cr-uid"},
 		Status:     nemoguardrailsv1alpha1.NemoGuardrailStatus{WorkloadNamespace: "old"},
@@ -300,7 +498,10 @@ func TestReleaseReadyWorkloadRemovesPreviousWhenReady(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, appsv1.AddToScheme(scheme))
+	// The shared NetworkPolicy helpers resolve the owner GVK from the scheme.
+	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
 	require.NoError(t, routev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
 	cr := &nemoguardrailsv1alpha1.NemoGuardrails{
 		ObjectMeta: metav1.ObjectMeta{Name: "nemo-guardrails", Namespace: "control-plane", UID: "cr-uid"},
 		Status:     nemoguardrailsv1alpha1.NemoGuardrailStatus{WorkloadNamespace: "old"},
@@ -320,7 +521,10 @@ func TestReleaseReadyWorkloadKeepsPreviousUntilRouteAdmitted(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, appsv1.AddToScheme(scheme))
+	// The shared NetworkPolicy helpers resolve the owner GVK from the scheme.
+	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
 	require.NoError(t, routev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
 	expose := true
 	cr := &nemoguardrailsv1alpha1.NemoGuardrails{
 		ObjectMeta: metav1.ObjectMeta{Name: "nemo-guardrails", Namespace: "control-plane", UID: "cr-uid"},
@@ -342,7 +546,10 @@ func TestReleaseReadyWorkloadRemovesPreviousWhenRouteAdmitted(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, appsv1.AddToScheme(scheme))
+	// The shared NetworkPolicy helpers resolve the owner GVK from the scheme.
+	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
 	require.NoError(t, routev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
 	expose := true
 	cr := &nemoguardrailsv1alpha1.NemoGuardrails{
 		ObjectMeta: metav1.ObjectMeta{Name: "nemo-guardrails", Namespace: "control-plane", UID: "cr-uid"},
@@ -372,7 +579,10 @@ func TestReleaseReadyWorkloadKeepsPreviousOnDeadline(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, appsv1.AddToScheme(scheme))
+	// The shared NetworkPolicy helpers resolve the owner GVK from the scheme.
+	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
 	require.NoError(t, routev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
 	cr := &nemoguardrailsv1alpha1.NemoGuardrails{
 		ObjectMeta: metav1.ObjectMeta{Name: "nemo-guardrails", Namespace: "control-plane", UID: "cr-uid"},
 		Status:     nemoguardrailsv1alpha1.NemoGuardrailStatus{WorkloadNamespace: "old"},
@@ -392,43 +602,6 @@ func TestReleaseReadyWorkloadKeepsPreviousOnDeadline(t *testing.T) {
 
 	require.NoError(t, reconciler.releaseReadyWorkload(context.Background(), cr, "models"))
 	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(previous), &appsv1.Deployment{}))
-}
-
-func TestWorkloadPortNamesFitServiceLimit(t *testing.T) {
-	cr := &nemoguardrailsv1alpha1.NemoGuardrails{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "nemo-guardrails", Namespace: "control-plane",
-			Annotations: map[string]string{"security.opendatahub.io/enable-auth": "true"},
-		},
-	}
-	identity := newWorkloadIdentity(cr, "redhat-ai-gateway-infra")
-	require.Equal(t, "control-plane-nemo-guardrails", identity.Name)
-	require.Equal(t, identity.Name, identity.Selector)
-	require.Equal(t, "https", identity.PortName)
-	require.Equal(t, "admin", identity.AdminPortName)
-	require.Equal(t, "control-plane-nemo-guardrails-serviceaccount", identity.ServiceAccount)
-	require.LessOrEqual(t, len(identity.PortName), maxServicePortNameLen)
-	require.LessOrEqual(t, len(identity.AdminPortName), maxServicePortNameLen)
-
-	sameNamespace := newWorkloadIdentity(cr, cr.Namespace)
-	require.Equal(t, "nemo-guardrails", sameNamespace.Name)
-	require.Equal(t, "nemo-guardrails", sameNamespace.Selector)
-	require.Equal(t, "nemo-guardrails", sameNamespace.PortName)
-
-	cr.Name = "test-nemoguardrails"
-	identity = newWorkloadIdentity(cr, "redhat-ai-gateway-infra")
-	require.Equal(t, prefixedWorkloadObjectName("control-plane", "test-nemoguardrails"), identity.Name)
-	require.Equal(t, identity.Name, identity.Selector)
-	require.Equal(t, "https", identity.PortName)
-	require.Equal(t, "admin", identity.AdminPortName)
-
-	long := &nemoguardrailsv1alpha1.NemoGuardrails{ObjectMeta: metav1.ObjectMeta{
-		Name: strings.Repeat("n", 40), Namespace: strings.Repeat("s", 40),
-	}}
-	identity = newWorkloadIdentity(long, "redhat-ai-gateway-infra")
-	require.Equal(t, prefixedWorkloadObjectName(long.Namespace, long.Name), identity.Name)
-	require.Equal(t, identity.Name, identity.Selector)
-	require.LessOrEqual(t, len(identity.Name), 63)
 }
 
 func TestEnsureDefaultConfigMapUsesShortName(t *testing.T) {
@@ -462,6 +635,7 @@ func TestDefaultConfigCopyNameKeepsDefaultSuffix(t *testing.T) {
 			NemoConfigs: []nemoguardrailsv1alpha1.NemoConfig{{
 				ConfigMaps: []string{source},
 			}},
+			AIGatewayMode: true,
 		},
 	}
 	legacy := legacyCopiedConfigMapNames(cr, "redhat-ai-gateway-infra")
@@ -480,6 +654,7 @@ func TestCopiedConfigMapNamesSkipInPlaceConfig(t *testing.T) {
 				Name:       "local",
 				ConfigMaps: []string{"local-config", defaultName},
 			}},
+			AIGatewayMode: true,
 		},
 	}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&corev1.ConfigMap{
@@ -496,11 +671,17 @@ func TestRejectUnownedServiceAccount(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, appsv1.AddToScheme(scheme))
+	// The shared NetworkPolicy helpers resolve the owner GVK from the scheme.
+	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
 	require.NoError(t, routev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
 	cr := &nemoguardrailsv1alpha1.NemoGuardrails{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "nemo-guardrails", Namespace: "control-plane", UID: "cr-uid",
 			Annotations: map[string]string{"security.opendatahub.io/enable-auth": "true"},
+		},
+		Spec: nemoguardrailsv1alpha1.NemoGuardrailsSpec{
+			AIGatewayMode: true,
 		},
 	}
 	account := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "control-plane-nemo-guardrails-serviceaccount", Namespace: "models"}}
@@ -515,9 +696,15 @@ func TestRequireOwnedOrAbsentLeavesUnownedDeployment(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, appsv1.AddToScheme(scheme))
+	// The shared NetworkPolicy helpers resolve the owner GVK from the scheme.
+	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
 	require.NoError(t, routev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
 	cr := &nemoguardrailsv1alpha1.NemoGuardrails{
 		ObjectMeta: metav1.ObjectMeta{Name: "nemo-guardrails", Namespace: "control-plane", UID: "cr-uid"},
+		Spec: nemoguardrailsv1alpha1.NemoGuardrailsSpec{
+			AIGatewayMode: true,
+		},
 	}
 	existing := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: "nemo-guardrails", Namespace: "models"},
@@ -546,7 +733,10 @@ func TestRetireUnscopedNamesRemovesLegacyObjects(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, appsv1.AddToScheme(scheme))
+	// The shared NetworkPolicy helpers resolve the owner GVK from the scheme.
+	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
 	require.NoError(t, routev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
 	cr := &nemoguardrailsv1alpha1.NemoGuardrails{
 		ObjectMeta: metav1.ObjectMeta{Name: "nemo-guardrails", Namespace: "control-plane", UID: "cr-uid"},
 		Spec: nemoguardrailsv1alpha1.NemoGuardrailsSpec{
@@ -554,6 +744,7 @@ func TestRetireUnscopedNamesRemovesLegacyObjects(t *testing.T) {
 				Name:       "nemo-config",
 				ConfigMaps: []string{"nemo-config"},
 			}},
+			AIGatewayMode: true,
 			Env: []corev1.EnvVar{{
 				Name: "API_TOKEN",
 				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
@@ -596,9 +787,15 @@ func TestRetireUnscopedNamesKeepsUnscopedUntilReady(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, appsv1.AddToScheme(scheme))
+	// The shared NetworkPolicy helpers resolve the owner GVK from the scheme.
+	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
 	require.NoError(t, routev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
 	cr := &nemoguardrailsv1alpha1.NemoGuardrails{
 		ObjectMeta: metav1.ObjectMeta{Name: "nemo-guardrails", Namespace: "control-plane", UID: "cr-uid"},
+		Spec: nemoguardrailsv1alpha1.NemoGuardrailsSpec{
+			AIGatewayMode: true,
+		},
 	}
 	owned := map[string]string{utils.OwnerUIDLabel: string(cr.UID)}
 
@@ -658,7 +855,10 @@ func TestReconcileDeletionDuringMigrationRemovesInfraObjects(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, appsv1.AddToScheme(scheme))
+	// The shared NetworkPolicy helpers resolve the owner GVK from the scheme.
+	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
 	require.NoError(t, routev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
 	require.NoError(t, rbacv1.AddToScheme(scheme))
 	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
 
@@ -668,6 +868,9 @@ func TestReconcileDeletionDuringMigrationRemovesInfraObjects(t *testing.T) {
 			Name: "nemo-guardrails", Namespace: "tenant", UID: "cr-uid",
 			Finalizers:        []string{finalizerName},
 			DeletionTimestamp: &now,
+		},
+		Spec: nemoguardrailsv1alpha1.NemoGuardrailsSpec{
+			AIGatewayMode: true,
 		},
 		Status: nemoguardrailsv1alpha1.NemoGuardrailStatus{WorkloadNamespace: "tenant"},
 	}
@@ -693,9 +896,15 @@ func TestDeleteOwnedInNamespaceLeavesOtherObjects(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, appsv1.AddToScheme(scheme))
+	// The shared NetworkPolicy helpers resolve the owner GVK from the scheme.
+	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
 	require.NoError(t, routev1.AddToScheme(scheme))
+	require.NoError(t, networkingv1.AddToScheme(scheme))
 	cr := &nemoguardrailsv1alpha1.NemoGuardrails{
 		ObjectMeta: metav1.ObjectMeta{Name: "nemo-guardrails", Namespace: "control-plane", UID: "cr-uid"},
+		Spec: nemoguardrailsv1alpha1.NemoGuardrailsSpec{
+			AIGatewayMode: true,
+		},
 	}
 	legacy := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
 		Name: "nemo-guardrails", Namespace: "old",
@@ -714,4 +923,119 @@ func TestDeleteOwnedInNamespaceLeavesOtherObjects(t *testing.T) {
 	require.Error(t, c.Get(context.Background(), client.ObjectKeyFromObject(legacy), &appsv1.Deployment{}))
 	require.Error(t, c.Get(context.Background(), client.ObjectKeyFromObject(labeled), &corev1.ConfigMap{}))
 	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(other), &appsv1.Deployment{}))
+}
+
+func TestCreateDeploymentProxyTLSValidationGatedOnAuthProxy(t *testing.T) {
+	// An invalid proxy TLS profile must only block workloads that render
+	// the kube-rbac-proxy sidecars; proxy-free workloads reconcile.
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, appsv1.AddToScheme(scheme))
+	require.NoError(t, nemoguardrailsv1alpha1.AddToScheme(scheme))
+
+	newCR := func(authAnnotation bool) *nemoguardrailsv1alpha1.NemoGuardrails {
+		cr := &nemoguardrailsv1alpha1.NemoGuardrails{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "nemo-guardrails",
+				Namespace: "test-ns",
+				UID:       "cr-uid",
+			},
+			Spec: nemoguardrailsv1alpha1.NemoGuardrailsSpec{
+				NemoConfigs: []nemoguardrailsv1alpha1.NemoConfig{{
+					Name:       "nemo-config",
+					ConfigMaps: []string{"nemo-config"},
+				}},
+			},
+		}
+		if authAnnotation {
+			cr.Annotations = map[string]string{constants.AuthAnnotationKey: "true"}
+		}
+		return cr
+	}
+	operatorConfig := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: constants.ConfigMap, Namespace: "operator-ns"},
+		Data:       map[string]string{nemoGuardrailsImageKey: "quay.io/trustyai/nemo-guardrails:test"},
+	}
+	userConfig := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "nemo-config", Namespace: "test-ns"},
+		Data:       map[string]string{"config.yaml": "models: []"},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorConfig, userConfig).Build()
+	reconciler := &NemoGuardrailsReconciler{Client: c, Scheme: scheme, Namespace: "operator-ns"}
+
+	previous, previousErr := pkgtls.CurrentProxyTLSArguments(), pkgtls.CurrentProxyTLSArgumentsError()
+	t.Cleanup(func() { pkgtls.SetProxyTLSArguments(previous, previousErr) })
+	pkgtls.SetProxyTLSArguments(pkgtls.ProxyTLSArguments{}, errors.New("cannot serve HTTP/2"))
+
+	deployment, err := reconciler.createDeployment(context.Background(), newCR(false), utils.CABundleInitContainerConfig{}, nil)
+	require.NoError(t, err, "proxy-free workload must not be blocked by the proxy TLS error")
+	require.NotEmpty(t, deployment.Name)
+
+	_, err = reconciler.createDeployment(context.Background(), newCR(true), utils.CABundleInitContainerConfig{}, nil)
+	require.ErrorContains(t, err, "cannot be applied to the kube-rbac-proxy sidecars")
+}
+
+// recordingDeleteClient records the kind of every Delete. Final state alone cannot
+// distinguish a cleanup that removes the policy first from one that removes it last.
+type recordingDeleteClient struct {
+	client.Client
+	deleted []string
+}
+
+func (c *recordingDeleteClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	c.deleted = append(c.deleted, reflect.TypeOf(obj).Elem().Name())
+	return c.Client.Delete(ctx, obj, opts...)
+}
+
+func TestDeleteOwnedInNamespaceRemovesWorkloadBeforeNetworkPolicy(t *testing.T) {
+	ctx := context.Background()
+	scheme, owner := nemoNetworkPolicyFixtureInAIGatewayMode(t)
+	inner := fake.NewClientBuilder().WithScheme(scheme).WithObjects(owner).Build()
+	recorder := &recordingDeleteClient{Client: inner}
+	reconciler := &NemoGuardrailsReconciler{Client: recorder, Scheme: scheme, Namespace: testNemoControllerNS}
+
+	if err := reconciler.reconcileNetworkPolicy(ctx, owner, testNemoInfraNamespace); err != nil {
+		t.Fatalf("reconcileNetworkPolicy() error = %v", err)
+	}
+	desired, err := buildNemoGuardrailsNetworkPolicy(owner, testNemoInfraNamespace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fake client runs no API server: pin the UID cleanup needs, and place the
+	// workload Deployment the policy protects.
+	policy := &networkingv1.NetworkPolicy{}
+	if err := inner.Get(ctx, client.ObjectKeyFromObject(desired.Policy), policy); err != nil {
+		t.Fatal(err)
+	}
+	policy.UID = types.UID("nemo-policy-uid")
+	if err := inner.Update(ctx, policy); err != nil {
+		t.Fatal(err)
+	}
+	deployment := nemoNetworkPolicyDeploymentFixture(owner, testNemoInfraNamespace)
+	if err := utils.SetOwnerReference(owner, deployment, scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := inner.Create(ctx, deployment); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder.deleted = nil
+	if err := reconciler.deleteOwnedInNamespace(ctx, owner, testNemoInfraNamespace); err != nil {
+		t.Fatalf("deleteOwnedInNamespace() error = %v", err)
+	}
+	indexOf := func(kind string) int {
+		for i, recorded := range recorder.deleted {
+			if recorded == kind {
+				return i
+			}
+		}
+		return -1
+	}
+	workload, policyIndex := indexOf("Deployment"), indexOf("NetworkPolicy")
+	if workload < 0 || policyIndex < 0 {
+		t.Fatalf("cleanup deletes = %v, want both the Deployment and the NetworkPolicy", recorder.deleted)
+	}
+	if policyIndex < workload {
+		t.Fatalf("cleanup deletes = %v, want the NetworkPolicy removed after the workload it protects", recorder.deleted)
+	}
 }

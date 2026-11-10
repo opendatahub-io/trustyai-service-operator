@@ -13,6 +13,7 @@ import (
 	"github.com/trustyai-explainability/trustyai-service-operator/controllers/utils"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,7 +31,10 @@ const (
 // deriveInfraNamespace returns the namespace where NemoGuardrails workloads should be deployed.
 // When the controller runs in a known ODH/RHOAI install namespace, workloads are centralized
 // into that platform's shared AI Gateway infra namespace. Otherwise, workloads default to the custom resource's own namespace.
-func deriveInfraNamespace(controllerNs, crNamespace string) string {
+func deriveInfraNamespace(controllerNs, crNamespace string, aiGatewayMode bool) string {
+	if !aiGatewayMode {
+		return crNamespace
+	}
 	switch controllerNs {
 	case "redhat-ods-applications":
 		return "redhat-ai-gateway-infra"
@@ -51,9 +55,6 @@ type workloadIdentity struct {
 	ServiceAccount string
 }
 
-// maxServicePortNameLen is the Kubernetes Service port name limit.
-const maxServicePortNameLen = 15
-
 func newWorkloadIdentity(nemoGuardrails *nemoguardrailsv1alpha1.NemoGuardrails, targetNamespace string) workloadIdentity {
 	name := nemoGuardrails.Name
 	// A shared infra namespace uses {namespace}-{cr-name} so two projects can reuse this custom resource name.
@@ -64,16 +65,7 @@ func newWorkloadIdentity(nemoGuardrails *nemoguardrailsv1alpha1.NemoGuardrails, 
 	// In a shared namespace the object name already includes the owning namespace.
 	selector := name
 	portName := name
-	if len(portName) > maxServicePortNameLen {
-		portName = "http"
-		if utils.RequiresAuth(nemoGuardrails) {
-			portName = "https"
-		}
-	}
 	adminPortName := name + "-admin"
-	if len(adminPortName) > maxServicePortNameLen {
-		adminPortName = "admin"
-	}
 	return workloadIdentity{
 		Name:           name,
 		Selector:       selector,
@@ -131,7 +123,7 @@ func dns1123Name(name string) string {
 
 // workloadNamespace is the namespace where this reconciler's Deployment, Service, and Route live.
 func (r *NemoGuardrailsReconciler) workloadNamespace(nemoGuardrails *nemoguardrailsv1alpha1.NemoGuardrails) string {
-	return deriveInfraNamespace(r.Namespace, nemoGuardrails.Namespace)
+	return deriveInfraNamespace(r.Namespace, nemoGuardrails.Namespace, nemoGuardrails.Spec.AIGatewayMode)
 }
 
 // rejectUnownedWorkload reports a name collision in namespace before any object there is created or any previous workload is deleted.
@@ -173,6 +165,16 @@ func (r *NemoGuardrailsReconciler) rejectUnownedWorkload(ctx context.Context, ne
 	}
 	for _, check := range checks {
 		if err := r.requireOwnedOrAbsent(ctx, nemoGuardrails, check.kind, check.obj); err != nil {
+			return err
+		}
+	}
+	// The operand NetworkPolicy is reconciled in the target namespace, so a
+	// foreign object at its deterministic name must block the move before any
+	// previous workload is deleted. In the default placement the target namespace
+	// is the custom resource namespace, where the check is a no-op for a policy
+	// this instance already owns.
+	if policyName, err := nemoNetworkPolicyName(nemoGuardrails); err == nil {
+		if err := r.requireOwnedOrAbsent(ctx, nemoGuardrails, "NetworkPolicy", &networkingv1.NetworkPolicy{ObjectMeta: meta(policyName)}); err != nil {
 			return err
 		}
 	}
@@ -312,7 +314,7 @@ func (r *NemoGuardrailsReconciler) releaseReadyWorkload(ctx context.Context, nem
 	return r.deleteOwnedInNamespace(ctx, nemoGuardrails, previous)
 }
 
-func (r *NemoGuardrailsReconciler) deleteOwnedInNamespace(ctx context.Context, owner client.Object, namespace string) error {
+func (r *NemoGuardrailsReconciler) deleteOwnedInNamespace(ctx context.Context, owner *nemoguardrailsv1alpha1.NemoGuardrails, namespace string) error {
 	if namespace == "" {
 		return nil
 	}
@@ -398,6 +400,44 @@ func (r *NemoGuardrailsReconciler) deleteOwnedInNamespace(ctx context.Context, o
 		if err := r.deleteNamedIfOwned(ctx, owner, obj); err != nil {
 			return err
 		}
+	}
+	// The operand NetworkPolicy cannot rely on garbage collection when it lives in
+	// the workload namespace instead of the custom resource namespace, so it is
+	// deleted here. It goes last on purpose: a Pod with no policy selecting it is
+	// not isolated at all, so the policy must outlive the workload it protects.
+	if err := r.deleteNamedNetworkPolicyIfOwned(ctx, owner, namespace); err != nil {
+		return err
+	}
+	return nil
+}
+
+// deleteNamedNetworkPolicyIfOwned removes the operand policy at its deterministic
+// name. Cross-namespace policies have no garbage collector, so this is the only
+// deletion path. utils.DeleteOwnedWorkloadNetworkPolicy verifies ownership through
+// the record the reconcile writes, refuses a policy whose UID changed, and pins the
+// delete to the UID and resourceVersion, so a replacement at the same name survives.
+func (r *NemoGuardrailsReconciler) deleteNamedNetworkPolicyIfOwned(ctx context.Context, owner *nemoguardrailsv1alpha1.NemoGuardrails, namespace string) error {
+	if namespace == "" {
+		return nil
+	}
+	policyName, err := nemoNetworkPolicyName(owner)
+	if err != nil {
+		return nil
+	}
+	policy := &networkingv1.NetworkPolicy{}
+	if err := r.Get(ctx, types.NamespacedName{Name: policyName, Namespace: namespace}, policy); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if !utils.IsOwnedBy(policy, owner) {
+		// A foreign object at the deterministic name is not ours to delete. The
+		// namespace-move guard reports it before anything is removed.
+		return nil
+	}
+	if err := utils.DeleteOwnedWorkloadNetworkPolicy(ctx, r.Client, r.Scheme, owner, client.ObjectKeyFromObject(policy), policy.UID, nemoNetworkPolicyAuthority(owner, namespace)); err != nil {
+		return fmt.Errorf("delete NemoGuardrails NetworkPolicy %s/%s: %w", namespace, policyName, err)
 	}
 	return nil
 }
@@ -594,6 +634,10 @@ func (r *NemoGuardrailsReconciler) ensureReferencedSecretsInNamespace(ctx contex
 
 		source := &corev1.Secret{}
 		if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: owner.Namespace}, source); err != nil {
+			// if it's an optional secret, it doesn't matter if it doesn't exist
+			if envVar.ValueFrom.SecretKeyRef.Optional != nil && *envVar.ValueFrom.SecretKeyRef.Optional {
+				continue
+			}
 			return fmt.Errorf("secret %s/%s referenced by spec.env: %w", owner.Namespace, secretName, err)
 		}
 		if _, err := r.ensureSecretInNamespace(ctx, owner, source, targetNamespace); err != nil {
@@ -731,14 +775,17 @@ func copyStringMap(in map[string]string) map[string]string {
 	return out
 }
 
-func rewriteSecretRefs(nemoGuardrails *nemoguardrailsv1alpha1.NemoGuardrails, targetNamespace string) []corev1.EnvVar {
+func rewriteResourceRefs(nemoGuardrails *nemoguardrailsv1alpha1.NemoGuardrails, targetNamespace string) []corev1.EnvVar {
 	env := make([]corev1.EnvVar, len(nemoGuardrails.Spec.Env))
 	for i, variable := range nemoGuardrails.Spec.Env {
 		env[i] = *variable.DeepCopy()
-		if env[i].ValueFrom == nil || env[i].ValueFrom.SecretKeyRef == nil {
+		if env[i].ValueFrom == nil {
 			continue
+		} else if env[i].ValueFrom.SecretKeyRef != nil {
+			env[i].ValueFrom.SecretKeyRef.Name = copiedObjectName(nemoGuardrails.Namespace, nemoGuardrails.Name, env[i].ValueFrom.SecretKeyRef.Name, targetNamespace)
+		} else if env[i].ValueFrom.ConfigMapKeyRef != nil {
+			env[i].ValueFrom.ConfigMapKeyRef.Name = copiedObjectName(nemoGuardrails.Namespace, nemoGuardrails.Name, env[i].ValueFrom.ConfigMapKeyRef.Name, targetNamespace)
 		}
-		env[i].ValueFrom.SecretKeyRef.Name = copiedObjectName(nemoGuardrails.Namespace, nemoGuardrails.Name, env[i].ValueFrom.SecretKeyRef.Name, targetNamespace)
 	}
 	return env
 }

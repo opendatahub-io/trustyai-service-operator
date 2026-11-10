@@ -26,6 +26,9 @@ func (r *EvalHubReconciler) reconcileDeployment(ctx context.Context, instance *e
 	log := log.FromContext(ctx)
 	log.Info("Reconciling Deployment", "name", instance.Name)
 
+	if err := pkgtls.CurrentProxyTLSArgumentsError(); err != nil {
+		return fmt.Errorf("%s: %w", pkgtls.ProxyTLSProfileUnsupportedMessage, err)
+	}
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      instance.Name,
@@ -56,7 +59,7 @@ func (r *EvalHubReconciler) reconcileDeployment(ctx context.Context, instance *e
 		if err := controllerutil.SetControllerReference(instance, deployment, r.Scheme); err != nil {
 			return err
 		}
-		if err := utils.LabelOwnedNetworkPolicyDeployment(deployment, r.Scheme, evalHubNetworkPolicyOwner(instance), identity); err != nil {
+		if err := utils.LabelOwnedNetworkPolicyDeployment(deployment, r.Scheme, evalHubNetworkPolicyOwner(instance), identity, utils.SameNamespaceOwnership); err != nil {
 			return err
 		}
 		log.Info("Creating Deployment", "name", deployment.Name)
@@ -67,7 +70,7 @@ func (r *EvalHubReconciler) reconcileDeployment(ctx context.Context, instance *e
 		if err := controllerutil.SetControllerReference(instance, deployment, r.Scheme); err != nil {
 			return err
 		}
-		if err := utils.LabelOwnedNetworkPolicyDeployment(deployment, r.Scheme, evalHubNetworkPolicyOwner(instance), identity); err != nil {
+		if err := utils.LabelOwnedNetworkPolicyDeployment(deployment, r.Scheme, evalHubNetworkPolicyOwner(instance), identity, utils.SameNamespaceOwnership); err != nil {
 			return err
 		}
 		log.Info("Updating Deployment", "name", deployment.Name)
