@@ -21,6 +21,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,7 @@ import (
 	openshifttls "github.com/openshift/controller-runtime-common/pkg/tls"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
@@ -69,11 +71,30 @@ type Result struct {
 	ProfileSpec      *configv1.TLSSecurityProfile
 	TLSAdherence     string
 	ProxyArgs        ProxyTLSArguments
+	// ProxyArgsErr defers a proxy-argument validation failure to reconcile
+	// time. The proxy arguments configure workload sidecars rendered by the
+	// reconcilers, so a profile the proxies cannot serve fails those
+	// reconciles (with a condition on the affected resource) instead of
+	// preventing the operator from starting.
+	ProxyArgsErr error
 }
+
+const (
+	// ReasonProxyTLSProfileUnsupported is the condition and event reason
+	// reconcilers publish when the cluster TLS profile cannot be rendered into
+	// kube-rbac-proxy arguments. It is exported so the resources affected by
+	// one process-wide policy failure report it under the same reason.
+	ReasonProxyTLSProfileUnsupported = "TLSProfileUnsupported"
+
+	// ProxyTLSProfileUnsupportedMessage is the shared message prefix for that
+	// failure. Callers append the underlying profile error.
+	ProxyTLSProfileUnsupportedMessage = "cluster TLS profile cannot be applied to the kube-rbac-proxy sidecars"
+)
 
 var proxyArgsState = struct {
 	sync.RWMutex
 	args ProxyTLSArguments
+	err  error
 }{
 	// Seeded from ResolveProxyTLSArguments so curve IDs stay aligned with
 	// defaultCurveGroups. init() re-resolves with the host FIPS setting.
@@ -95,18 +116,36 @@ func mustDefaultProxyTLSArguments(fips bool) ProxyTLSArguments {
 
 // SetProxyTLSArguments publishes the arguments used by workload builders.
 // Callers must resolve and validate the complete value before publishing it.
-func SetProxyTLSArguments(args ProxyTLSArguments) {
+// A non-nil err publishes the deferred validation failure instead: workload
+// builders then fail their reconcile until the cluster profile is fixed,
+// rather than rendering sidecars that cannot start.
+func SetProxyTLSArguments(args ProxyTLSArguments, err error) {
 	proxyArgsState.Lock()
 	defer proxyArgsState.Unlock()
+	proxyArgsState.err = err
+	if err != nil {
+		proxyArgsState.args = ProxyTLSArguments{}
+		return
+	}
 	proxyArgsState.args = copyProxyTLSArguments(args)
 }
 
 // CurrentProxyTLSArguments returns a copy of the arguments currently used by
-// workload builders.
+// workload builders. When the resolved cluster profile could not be served by
+// the proxies, the returned value is empty and CurrentProxyTLSArgumentsError
+// reports the reason; callers must check the error before rendering.
 func CurrentProxyTLSArguments() ProxyTLSArguments {
 	proxyArgsState.RLock()
 	defer proxyArgsState.RUnlock()
 	return copyProxyTLSArguments(proxyArgsState.args)
+}
+
+// CurrentProxyTLSArgumentsError reports the deferred validation failure for
+// workload builders, if any.
+func CurrentProxyTLSArgumentsError() error {
+	proxyArgsState.RLock()
+	defer proxyArgsState.RUnlock()
+	return proxyArgsState.err
 }
 
 func copyProxyTLSArguments(args ProxyTLSArguments) ProxyTLSArguments {
@@ -118,7 +157,7 @@ func copyProxyTLSArguments(args ProxyTLSArguments) ProxyTLSArguments {
 
 func init() {
 	if args, err := ResolveProxyTLSArguments(nil, TLSAdherenceNoOpinion, nil, fipsModeEnabled()); err == nil {
-		SetProxyTLSArguments(args)
+		SetProxyTLSArguments(args, nil)
 	}
 }
 
@@ -177,24 +216,42 @@ func resolveTLSProfileState(state profileState, readErr error) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	// Resolve the APIServer profile and adherence together before publishing
-	// the complete configuration to workload builders.
-	result.ProxyArgs, err = ResolveProxyTLSArguments(
+	// Resolve the proxy arguments for workload builders. A profile the
+	// proxies cannot serve is a workload concern: the failure is deferred to
+	// the reconcilers (which surface it on the affected resource) instead of
+	// preventing the operator from starting.
+	result.ProxyArgs, result.ProxyArgsErr = ResolveProxyTLSArguments(
 		state.profile,
 		result.TLSAdherence,
 		nil,
 		fipsModeEnabled(),
 	)
-	if err != nil {
-		return Result{}, fmt.Errorf("resolving proxy TLS arguments: %w", err)
+	if result.ProxyArgsErr != nil {
+		result.ProxyArgs = ProxyTLSArguments{}
+		result.ProxyArgsErr = fmt.Errorf("resolving proxy TLS arguments: %w", result.ProxyArgsErr)
 	}
 	return result, nil
 }
 
 func isTransientTLSReadError(err error) bool {
-	return apierrors.IsServiceUnavailable(err) || apierrors.IsTimeout(err) ||
+	// Explicitly transient API statuses first.
+	if apierrors.IsServiceUnavailable(err) || apierrors.IsTimeout(err) ||
 		apierrors.IsServerTimeout(err) || apierrors.IsTooManyRequests(err) ||
-		errors.Is(err, context.DeadlineExceeded)
+		apierrors.IsInternalError(err) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	// Any other API-status error is a server-side rejection the caller did
+	// not already classify (NotFound and NoMatch are handled earlier): fail
+	// closed rather than letting the transport predicates below catch it.
+	var statusErr *apierrors.StatusError
+	if errors.As(err, &statusErr) {
+		return false
+	}
+	// Transport-level errors for non-API-status failures.
+	var netErr net.Error
+	return utilnet.IsConnectionRefused(err) || utilnet.IsConnectionReset(err) ||
+		utilnet.IsProbableEOF(err) || utilnet.IsHTTP2ConnectionLost(err) ||
+		(errors.As(err, &netErr) && netErr.Timeout())
 }
 
 // readTLSProfileStateWithRetry never substitutes defaults for an unread policy.
