@@ -175,6 +175,10 @@ policy-check: kustomize conftest ## Check rendered manifests against all policie
 	done; \
 	exit $$failed
 
+.PHONY: lint-manifests
+lint-manifests: ## Lint rendered manifests with kube-linter. Set KUBE_LINTER_FAIL_ON_FINDINGS=false to warn only.
+	bash ./hack/lint-manifests.sh
+
 ##@ Build
 
 .PHONY: build
