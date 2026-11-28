@@ -31,4 +31,4 @@ tests/artifacts/*
 controllers/lmes/driver/mycatalogs*
 controllers/lmes/driver/mytasks*
 controllers/lmes/driver/outputs*
-/.gocache/
+/.gocache/__pycache__/

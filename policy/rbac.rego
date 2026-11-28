@@ -42,7 +42,7 @@ expected_crbs := {
 	"trustyai-service-operator-evalhub-job-config-binding": "trustyai-service-operator-evalhub-job-config",
 
 	# --- component: evalhub (un-prefixed overlay: evalhub-only) ---
-	"evalhub-manager-rolebinding": "trustyai-service-operator-evalhub-manager-role",
+	"evalhub-manager-rolebinding": "evalhub-manager-role",
 	"evalhub-collections-access-binding": "evalhub-collections-access",
 	"evalhub-providers-access-binding": "evalhub-providers-access",
 	"evalhub-mlflow-access-binding": "evalhub-mlflow-access",

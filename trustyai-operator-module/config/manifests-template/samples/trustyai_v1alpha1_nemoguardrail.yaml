@@ -1,9 +1,16 @@
 apiVersion: trustyai.opendatahub.io/v1alpha1
-kind: NemoGuardrail
+kind: NemoGuardrails
 metadata:
   labels:
     app.kubernetes.io/name: trustyai-service-operator
     app.kubernetes.io/managed-by: kustomize
-  name: nemoguardrail-sample
+  name: nemoguardrails-sample
 spec:
-  # TODO(user): Add fields here
+  # nemoConfigs is required; each entry mounts the files of the referenced
+  # ConfigMaps under /app/config/$name in the NeMo Guardrails server pod.
+  nemoConfigs:
+    - name: sample-config
+      configMaps:
+        # Create this ConfigMap before applying the sample, e.g. with the
+        # guardrails server's config.yaml.
+        - nemoguardrails-sample-config

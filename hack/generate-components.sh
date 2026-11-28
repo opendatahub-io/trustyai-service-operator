@@ -96,7 +96,7 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: trustyai-service-operator-${component}-manager-role
+  name: ${component}-manager-role
 subjects:
   - kind: ServiceAccount
     name: controller-manager

@@ -12,7 +12,7 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: trustyai-service-operator-lmes-manager-role
+  name: lmes-manager-role
 subjects:
   - kind: ServiceAccount
     name: controller-manager

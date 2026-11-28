@@ -1,0 +1,137 @@
+name: PR Build Validation (Konflux simulator)
+
+# Simulates, at PR time, what the Konflux pipelines build from this repository
+# (manager, ta-lmes-driver, trustyai-operator-module) and the contracts the
+# shipped manifests must hold. See docs/pr-build-validation.md.
+#
+# Security posture:
+# - only the default pull_request event (never pull_request_target)
+# - read-only contents permission, no persist-credentials
+# - actions pinned by commit SHA
+# - no PR-author-controlled text is interpolated into run: steps
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Single skip gate: everything downstream keys off this one decision.
+  changes:
+    name: Skip gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_run: ${{ steps.filter.outputs.should_run }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Detect relevant changes
+        id: filter
+        run: |
+          set -euo pipefail
+          BASE="origin/main"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="origin/${{ github.base_ref }}"
+          fi
+          if ! git rev-parse --verify --quiet "$BASE" >/dev/null; then
+            echo "base ref $BASE not available; running validation (fail closed)"
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PATTERNS='^(Dockerfile(\.driver)?|go\.(mod|sum)|Makefile(\..*)?|hack/|api/|controllers/|cmd/|pkg/|config/|trustyai-operator-module/|scripts/(validate-build\.sh|manifest_contract\.py)|\.github/workflows/pr-build-validation\.yml)'
+          changed=$(git diff --name-only "$BASE"...HEAD)
+          if grep -Eq "$PATTERNS" <<<"$changed"; then
+            echo "relevant changes detected; running validation"
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no relevant changes; validation will be skipped"
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  validate:
+    name: ${{ matrix.mode }}
+    needs: changes
+    if: needs.changes.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [static, hermetic, manifests, images, downstream, drift]
+    env:
+      CONTAINER_TOOL: docker
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491  # v5.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Set up python (PyYAML for manifest contracts)
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet pyyaml
+          echo "PYTHON_BIN=$RUNNER_TEMP/venv/bin/python3" >> "$GITHUB_ENV"
+
+      - name: Run ${{ matrix.mode }} validation
+        env:
+          BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'origin/main' }}
+        run: |
+          set -euo pipefail
+          ./scripts/validate-build.sh "${{ matrix.mode }}"
+
+  # Fail-closed summary: this job is the required status check. It fails when
+  # validation was required but did not succeed, and only passes when
+  # validation passed or was legitimately skipped by the gate.
+  summary:
+    name: PR build validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    needs: [changes, validate]
+    if: always()
+    steps:
+      - name: Fail closed
+        env:
+          # Expressions are passed via env (not interpolated into the run
+          # string) per zizmor's template-injection guidance.
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          SHOULD_RUN: ${{ needs.changes.outputs.should_run }}
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "FAIL: skip gate job did not succeed (result: '$CHANGES_RESULT') — treating as run-required"
+            exit 1
+          fi
+          if [ "$SHOULD_RUN" != "true" ] && [ "$SHOULD_RUN" != "false" ]; then
+            echo "FAIL: skip gate produced no should_run output ('$SHOULD_RUN')"
+            exit 1
+          fi
+          if [ "$SHOULD_RUN" = "false" ]; then
+            echo "SKIP: no build-relevant paths changed"
+            exit 0
+          fi
+          if [ "$VALIDATE_RESULT" != "success" ]; then
+            echo "FAIL: build validation was required but result was '$VALIDATE_RESULT'"
+            exit 1
+          fi
+          echo "OK: build validation passed"
